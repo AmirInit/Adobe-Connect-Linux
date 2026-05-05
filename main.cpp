@@ -67,6 +67,18 @@ void maximizeWindow(Window win, Display *display)
 
 int main(int argc, char *argv[])
 {
+    CefMainArgs main_args(argc, argv);
+    CefRefPtr<MyApp> cefapp(new MyApp);
+
+    // CEF applications have multiple sub-processes (render, gpu, etc) that share
+    // the same executable. This function checks the command-line and, if this is
+    // a sub-process, executes the appropriate logic.
+    int exit_code = CefExecuteProcess(main_args, cefapp.get(), nullptr);
+    if (exit_code >= 0) {
+        // The sub-process has completed so return here.
+        return exit_code;
+    }
+
     string launch_args = "";
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -81,13 +93,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    CefMainArgs main_args(argc, argv);
-
     CefWindowInfo window_info;
     CefSettings settings;
     CefBrowserSettings browser_settings = CefBrowserSettings();
 
-    CefRefPtr<MyApp> cefapp(new MyApp);
     CefRefPtr<MyClient> cefclient(new MyClient);
 
     const char* user_login = getlogin();
