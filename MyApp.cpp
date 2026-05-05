@@ -13,4 +13,5 @@ void MyApp::OnBeforeCommandLineProcessing(const CefString &process_type, CefRefP
     command_line->AppendSwitch("no-sandbox");
     command_line->AppendSwitch("enable-media-stream");
     command_line->AppendSwitch("enable-usermedia-screen-capturing");
+    command_line->AppendSwitch("ignore-certificate-errors");
 }
