@@ -67,7 +67,19 @@ void maximizeWindow(Window win, Display *display)
 
 int main(int argc, char *argv[])
 {
-    string launch_args = string(argv[1]);
+    string launch_args = "";
+    for (int i = 1; i < argc; ++i) {
+        string arg = argv[i];
+        if (arg.find("connectpro://") == 0) {
+            launch_args = arg;
+            break;
+        }
+    }
+
+    if (launch_args.empty()) {
+        cerr << "Error: No connectpro:// URL provided. Exiting." << endl;
+        return 1;
+    }
 
     CefMainArgs main_args(argc, argv);
 
@@ -78,7 +90,18 @@ int main(int argc, char *argv[])
     CefRefPtr<MyApp> cefapp(new MyApp);
     CefRefPtr<MyClient> cefclient(new MyClient);
 
-    string cache_path = "/home/" + string(getlogin()) + "/.config/";
+    const char* user_login = getlogin();
+    string cache_path;
+    if (user_login) {
+        cache_path = "/home/" + string(user_login) + "/.config/";
+    } else {
+        const char* home_env = getenv("HOME");
+        if (home_env) {
+            cache_path = string(home_env) + "/.config/";
+        } else {
+            cache_path = "/tmp/.config/";
+        }
+    }
     CefString(&settings.root_cache_path).FromString(cache_path);
     CefString(&settings.cache_path).FromString(cache_path + "adobe_connect/cache");
 

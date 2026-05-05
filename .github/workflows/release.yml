@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libx11-dev wget tar
+
+      - name: Build Project
+        run: |
+          ./make.sh
+
+      - name: Package Artifacts
+        run: |
+          tar -czvf adobe-connect-linux.tar.gz -C Release .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: adobe-connect-linux.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
