@@ -34,6 +34,10 @@ You can also launch the application directly from the command line:
 ```bash
 ./connect "connectpro://YOUR_URL"
 ```
+Example:
+```bash
+~/.local/share/adobe-connect/connect "connectpro://vadavc41.ec.iau.ir/l993retztu2a/?session=adminbreezbf4z42bw46m46pp5"
+```
 
 *Note: The `--ignore-certificate-errors` flag is hardcoded internally to bypass strict DPI/firewall SSL interceptions, meaning you do not need to pass it manually.*
 ## FAQ
