@@ -1,0 +1,13 @@
+[project]
+name = "connect-dl"
+version = "1.0.0"
+description = "Download and rebuild Adobe Connect class recordings"
+requires-python = ">=3.9"
+dependencies = []          # standard library only; ffmpeg is an external tool
+
+[project.scripts]
+connect-dl = "connect_dl.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

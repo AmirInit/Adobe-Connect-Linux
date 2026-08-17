@@ -3,7 +3,16 @@
 This project is an unofficial Linux client for the Adobe Connect meeting application
 
 Adobe Connect does not have a linux version officially, however, since it's written in flash, it's possible to run it in a browser. This project, uses an underlying chromium browser with flash support to run the flash file behind the meetings. It provides the binding necessary to automatically launch the app just like the Windows version for convenience.
-This project uses [Chromium Embedded Framework](https://github.com/chromiumembedded) to utlize the underlying browser
+This project uses [Chromium Embedded Framework](https://github.com/chromiumembedded) to utilize the underlying browser
+
+> **A note on Flash.** The live-meeting client is pinned to CEF 86 (Chromium 86)
+> on purpose: Chromium removed the PPAPI Flash plugin interface in version 88,
+> and the classic Adobe Connect meeting room is a Flash application. Upgrading
+> CEF would build fine and then fail to load any meeting, so the pin stays until
+> the target server is migrated to Connect's HTML client. This affects **live
+> meetings only** — `tools/connect-dl` does not use CEF or Flash at all, so
+> downloading and replaying recordings is unaffected.
+
 
 ![Alt text](preview.png?raw=true "Preview Image")
 (an Ubuntu desktop running Adobe Connect Linux)
@@ -40,6 +49,31 @@ Example:
 ```
 
 *Note: The `--ignore-certificate-errors` flag is hardcoded internally to bypass strict DPI/firewall SSL interceptions, meaning you do not need to pass it manually.*
+## Downloading recordings
+
+Joining a live class is only half of what this repository is for. `tools/connect-dl`
+downloads a **recorded** class and rebuilds it into files you can actually play —
+above all a single continuous audio track of the lecturer's voice, which you can
+then listen to at any speed.
+
+```bash
+sudo apt install ffmpeg          # the one external dependency
+
+# download a recording and rebuild it
+./tools/connect-dl/connect-dl get "https://connect.example.edu/p8fj3k2la9x/" \
+    -u you@example.edu -o ./class07
+```
+
+You get the lecture as an `.mp3`, a reconstructed `.mp4` of the shared screen
+with the webcam and audio, and a `play.html` offline player with a **playback
+speed control** (0.75×–4×, pitch-corrected) plus chapter and chat sidebars —
+the thing Connect's own player never offered.
+
+Signing in through university SSO? Copy the `BREEZESESSION` cookie out of a
+logged-in browser and pass `--session`. Full documentation, including how to fix
+a stream that plays out of sync, is in
+[tools/connect-dl/README.md](tools/connect-dl/README.md).
+
 ## FAQ
 If the app does not open, try the following command:
 ```

@@ -28,3 +28,7 @@ repo
 *.yml
 flatpak_connect.desktop
 connect-test
+
+# Python
+__pycache__/
+*.pyc

@@ -1,7 +1,10 @@
+#ifndef ADOBE_CONNECT_MYAPP_H_
+#define ADOBE_CONNECT_MYAPP_H_
+
 #include "include/cef_app.h"
-#include "include/wrapper/cef_helpers.h"
+
 class MyApp : public CefApp, public CefRenderProcessHandler
-{    
+{
 public:
     MyApp();
     CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override
@@ -11,3 +14,5 @@ public:
     void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override;
     IMPLEMENT_REFCOUNTING(MyApp);
 };
+
+#endif  // ADOBE_CONNECT_MYAPP_H_
