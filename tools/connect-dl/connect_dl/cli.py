@@ -373,3 +373,10 @@ def _safe_name(title: str | None) -> str | None:
     cleaned = re.sub(r"[^\w؀-ۿ .-]+", "", title, flags=re.UNICODE).strip()
     cleaned = re.sub(r"\s+", "-", cleaned)
     return cleaned[:80] or None
+
+
+# `python3 -m connect_dl` goes through __main__.py; running this module directly
+# as `python3 -m connect_dl.cli` executes it with __name__ == "__main__" and
+# would otherwise define main() and exit 0 without ever calling it.
+if __name__ == "__main__":
+    sys.exit(main())
