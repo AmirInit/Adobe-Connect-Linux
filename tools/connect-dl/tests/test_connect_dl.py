@@ -3,17 +3,22 @@
 import contextlib
 import io
 import os
+import socket
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from connect_dl.api import AuthError, ConnectClient, ConnectError, looks_like_login_page
+from connect_dl.api import (
+    AuthError, ConnectClient, ConnectError, _permanent_reason, looks_like_login_page,
+)
 from connect_dl.cli import _client
 from connect_dl.archive import Role, Stream, unpack
 from connect_dl.fetch import _MP4_CANDIDATES, _ZIP_CANDIDATES, download_recording
@@ -373,6 +378,39 @@ class TestDownloadFailsFastOnLogin(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, AuthError)
         self.assertGreaterEqual(client.calls, len(_MP4_CANDIDATES) + len(_ZIP_CANDIDATES))
         self.assertIn("could not obtain a downloadable recording", str(caught.exception))
+
+
+class TestPermanentTransportErrors(unittest.TestCase):
+    """The bug: unresolvable hosts and bad certs were retried 4x over 15s."""
+
+    def test_dns_failure_is_permanent(self):
+        wrapped = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        self.assertIn("could not be resolved", _permanent_reason(wrapped))
+
+    def test_cert_failure_is_permanent_when_wrapped(self):
+        err = ssl.SSLCertVerificationError("self signed certificate")
+        self.assertIn("--insecure", _permanent_reason(urllib.error.URLError(err)))
+
+    def test_cert_failure_is_permanent_when_raised_directly(self):
+        # ssl.SSLError.reason is a str, so this only works if the exception
+        # itself is inspected and not just its .reason.
+        err = ssl.SSLCertVerificationError("self signed certificate")
+        err.reason = "CERTIFICATE_VERIFY_FAILED"
+        self.assertIn("--insecure", _permanent_reason(err))
+
+    def test_transient_errors_are_still_retried(self):
+        self.assertIsNone(_permanent_reason(TimeoutError("timed out")))
+        self.assertIsNone(_permanent_reason(urllib.error.URLError(ConnectionResetError())))
+
+    def test_dns_failure_does_not_retry(self):
+        client = ConnectClient(origin="https://nope.invalid")
+        with mock.patch.object(
+            client._opener, "open",
+            side_effect=urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
+        ) as opened:
+            with self.assertRaises(ConnectError):
+                client._open("https://nope.invalid/api/xml")
+        self.assertEqual(opened.call_count, 1)
 
 
 class _Args:

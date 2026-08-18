@@ -22,6 +22,7 @@ import gzip
 import http.cookiejar
 import io
 import logging
+import socket
 import ssl
 import time
 import urllib.error
@@ -49,6 +50,33 @@ _LOGIN_MARKERS = (
     b'name="login"',
     b"session-timeout",
 )
+
+
+def _permanent_reason(exc: Exception) -> str | None:
+    """Explain ``exc`` if retrying it cannot possibly help, else ``None``."""
+    # urllib wraps transport errors in URLError.reason, but ssl.SSLError is
+    # also raised directly - and its own .reason is a *string* ("CERTIFICATE_
+    # VERIFY_FAILED"), so both the exception and its reason must be examined.
+    candidates = [exc]
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        candidates.append(reason)
+
+    for item in candidates:
+        if isinstance(item, ssl.SSLCertVerificationError):
+            detail = getattr(item, "verify_message", None) or item
+            return (
+                f"the TLS certificate could not be verified ({detail}). If this "
+                "server sits behind an intercepting proxy or uses a self-signed "
+                "certificate, re-run with --insecure."
+            )
+        if isinstance(item, socket.gaierror):
+            return (
+                f"the host name could not be resolved ({item.strerror or item}). "
+                "Check the link for a typo, and that you are on a network that "
+                "can reach this server."
+            )
+    return None
 
 
 def looks_like_login_page(raw: bytes) -> bool:
@@ -143,6 +171,12 @@ class ConnectClient:
                     raise
                 last_error = exc
             except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
+                # Some transport failures are verdicts, not hiccups: retrying a
+                # name that does not resolve or a certificate that does not
+                # verify just multiplies the wait before the same error.
+                permanent = _permanent_reason(exc)
+                if permanent:
+                    raise ConnectError(f"could not reach {self.origin}: {permanent}") from exc
                 last_error = exc
             backoff = 2 ** attempt
             log.warning("request to %s failed (%s), retrying in %ss", url, last_error, backoff)

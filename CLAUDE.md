@@ -157,6 +157,14 @@ Observed behaviour that is easy to get wrong, and that the code now defends agai
   anonymous session as a hard error; otherwise a stale cookie is indistinguishable from passing
   no credentials and the run fails much later blaming the recording.
 - Connect sessions are short-lived, so `--session` cookies go stale quickly during testing.
+- That host's TLS certificate **does** verify normally — `--insecure` is not needed for it,
+  despite the C++ client hardcoding `--ignore-certificate-errors`. Do not reach for `--insecure`
+  as a first resort.
+
+`ConnectClient._open` retries with exponential backoff, but `_permanent_reason()` classifies
+DNS-resolution and certificate-verification failures as verdicts and fails immediately — retrying
+those only multiplies the wait before the identical error. Note `ssl.SSLError.reason` is a
+*string*, not an exception, so that helper inspects both the exception and its `.reason`.
 
 Testing against a real server needs credentials — read them from `CONNECT_SESSION` /
 `CONNECT_PASSWORD`, never commit them.
