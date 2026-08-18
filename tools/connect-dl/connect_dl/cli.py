@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .api import AuthError, ConnectClient, ConnectError, Recording
+from .api import AuthError, ConnectClient, ConnectError, Recording  # noqa: F401
 from .archive import RecordingArchive, Role, unpack
 from .fetch import download_recording
 from .flv import LEGACY_AUDIO, LEGACY_VIDEO
@@ -21,6 +21,17 @@ from .player import PlayerSources, write_player
 from .urls import InvalidLink, parse_link
 
 log = logging.getLogger("connect-dl")
+
+# Connect's API says only "no-access" whether you are anonymous, signed in
+# without rights, or holding an expired cookie, so spell out the options.
+_AUTH_HINT = (
+    "  This server does not allow anonymous access to the API.\n"
+    "  Sign in with -u/--user EMAIL, or - if your account uses university "
+    "SSO/Shibboleth,\n"
+    "  log into Connect in a browser and pass the BREEZESESSION cookie with "
+    "--session\n"
+    "  (developer tools -> Application -> Cookies)."
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,7 +155,17 @@ def _client(args) -> tuple[ConnectClient, object]:
     if session:
         client.set_session(session)
         who = client.check_session()
-        log.info("using supplied session%s", f" (logged in as {who})" if who else "")
+        if not who:
+            # An expired or mistyped cookie otherwise behaves exactly like
+            # passing nothing at all, and the run fails much later with a
+            # generic "not public" message that blames the recording.
+            raise AuthError(
+                "the BREEZESESSION value supplied is not a valid logged-in "
+                "session (the server treats it as anonymous). It has probably "
+                "expired - Connect sessions are short-lived. Log in again in a "
+                "browser and copy a fresh BREEZESESSION cookie."
+            )
+        print(f"signed in as {who}")
     elif args.user:
         password = args.password or os.environ.get("CONNECT_PASSWORD")
         if not password:
@@ -160,7 +181,11 @@ def cmd_list(args) -> int:
     if not link.url_path and not link.sco_id:
         raise ConnectError("that link does not identify a room or folder")
 
-    sco = client.sco_info(link.sco_id) if link.sco_id else client.resolve_url_path(link.url_path)
+    try:
+        sco = (client.sco_info(link.sco_id) if link.sco_id
+               else client.resolve_url_path(link.url_path))
+    except AuthError as exc:
+        raise AuthError(f"{exc}\n{_AUTH_HINT}") from exc
     sco_id = sco.get("sco-id", "")
     recordings = client.meeting_recordings(sco_id)
 
@@ -185,13 +210,17 @@ def cmd_get(args) -> int:
     # A room link has no recording of its own; ask which archive is meant.
     if link.url_path:
         try:
-            sco = client.resolve_url_path(link.url_path)
-            if (sco.findtext("icon") or sco.get("icon") or "") == "meeting":
-                recordings = client.meeting_recordings(sco.get("sco-id", ""))
-                link = _choose(recordings, link)
-        except (ConnectError, AuthError) as exc:
+            link = _resolve_room(client, link)
+        except AuthError as exc:
             # Anonymous or restricted accounts cannot call the API; the direct
-            # asset download often still works, so carry on.
+            # asset download sometimes still works for public recordings, so
+            # carry on - but say plainly what could not be checked, because the
+            # download is about to fail for the same reason.
+            print(f"note: cannot identify {link.base} - {exc}")
+            print("      so it is unknown whether this is a recording or a "
+                  "meeting room.")
+            print(_AUTH_HINT + "\n")
+        except ConnectError as exc:
             log.info("could not query the API (%s); trying the link directly", exc)
 
     print(f"downloading {link.base}")
@@ -229,6 +258,45 @@ def cmd_inspect(args) -> int:
 
 
 # ------------------------------------------------------------------ pipeline
+
+# Connect labels every SCO with an icon.  A recording is "archive"; the things
+# a user is most likely to paste by mistake are rooms and folders, which have no
+# downloadable payload of their own.
+_CONTAINER_ICONS = {
+    "meeting": "meeting room",
+    "folder": "folder",
+    "curriculum": "curriculum",
+    "event": "event",
+}
+
+
+def _resolve_room(client: ConnectClient, link):
+    """Turn a room/folder link into a recording link, saying so out loud.
+
+    Raises ConnectError with an explicit explanation when the link identifies a
+    container that holds no recordings - previously this fell through to the
+    downloader, which polled a login page for half an hour.
+    """
+    sco = client.resolve_url_path(link.url_path)
+    icon = (sco.get("icon") or sco.findtext("icon") or "").strip()
+    kind = _CONTAINER_ICONS.get(icon)
+    if kind is None:
+        return link  # an archive (or something else with its own payload)
+
+    name = sco.findtext("name") or link.url_path
+    print(f"{link.base} is a {kind} ({name!r}), not a recording.")
+
+    recordings = client.meeting_recordings(sco.get("sco-id", ""))
+    if not recordings:
+        raise ConnectError(
+            f"that link is a {kind}, not a recording, and it contains no "
+            "recordings this account can see. Open the room in a browser, find "
+            "the recording you want, and pass its link instead."
+        )
+
+    print(f"it contains {len(recordings)} recording(s).\n")
+    return _choose(recordings, link)
+
 
 def _choose(recordings: list[Recording], link):
     if not recordings:

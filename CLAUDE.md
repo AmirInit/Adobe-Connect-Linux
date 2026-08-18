@@ -133,3 +133,30 @@ The tool models a recording as: **fetch → identify → align → render**, imp
 Design invariant worth preserving: audio rendering must never be taken down by a video failure —
 `_produce()` catches video `RuntimeError` and downgrades it to a note rather than failing the
 whole command.
+
+### How a real Connect server behaves (verified against `vadavc41.ec.iau.ir`, Connect 10.8.0)
+
+Observed behaviour that is easy to get wrong, and that the code now defends against:
+
+- **Auth failures arrive as HTTP 200 + an HTML login page, not 401/403.** Requesting
+  `<room>/output/recording.zip?download=zip` unauthenticated returns `Content-Type: text/html`
+  with the "Adobe Connect Central Login" page. Nothing but the *body* distinguishes this from the
+  legitimate "still building your zip" holding page that the poll loop is designed around.
+  `api.looks_like_login_page()` makes that distinction, and `fetch._try_download` raises
+  `AuthError` on it. Without this the tool polls a login page for the full 30-minute
+  `--poll-timeout`. **Any new response-classification code must keep login pages terminal and
+  holding pages retryable** — conflating them in either direction is a bad failure.
+- **The XML API refuses anonymous access entirely**: `sco-by-url` returns `no-access`. So for an
+  unauthenticated user the tool cannot tell a recording from a meeting room, and must say so
+  rather than guessing.
+- **`no-access` is returned for every distinct auth problem** — anonymous, signed-in-without-
+  rights, and expired-cookie all look identical. Error messages therefore have to enumerate the
+  possibilities (`_AUTH_HINT` in `cli.py`) instead of asserting one cause.
+- **An expired/invalid `BREEZESESSION` authenticates as anonymous rather than erroring.**
+  `check_session()` returning `None` is the only signal, so `_client()` treats a supplied-but-
+  anonymous session as a hard error; otherwise a stale cookie is indistinguishable from passing
+  no credentials and the run fails much later blaming the recording.
+- Connect sessions are short-lived, so `--session` cookies go stale quickly during testing.
+
+Testing against a real server needs credentials — read them from `CONNECT_SESSION` /
+`CONNECT_PASSWORD`, never commit them.

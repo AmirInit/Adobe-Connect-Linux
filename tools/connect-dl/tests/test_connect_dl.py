@@ -1,15 +1,22 @@
 """Tests for connect-dl.  Run with:  python3 -m unittest discover tools/connect-dl/tests"""
 
+import contextlib
+import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from connect_dl.api import AuthError, ConnectClient, ConnectError, looks_like_login_page
+from connect_dl.cli import _client
 from connect_dl.archive import Role, Stream, unpack
+from connect_dl.fetch import _MP4_CANDIDATES, _ZIP_CANDIDATES, download_recording
 from connect_dl.flv import scan_flv
 from connect_dl.index import parse_events
 from connect_dl.media import atempo_chain, build_audio_filter, build_video_filter
@@ -275,6 +282,146 @@ class TestArchiveSafety(unittest.TestCase):
                 zf.writestr("../escaped.txt", "nope")
             with self.assertRaises(ValueError):
                 unpack(evil, rec.path / "out")
+
+
+# ------------------------------------------------- regressions found against
+# a real server (Adobe Connect 10.8.0, vadavc41.ec.iau.ir)
+
+# Trimmed from what that server actually returns for an unauthenticated
+# request to <room>/output/recording.zip?download=zip - note the HTTP status is
+# 200 and the content-type is text/html, so nothing but the body reveals it.
+LOGIN_PAGE = (
+    b'<html lang="en">\r\n<head>\r\n<title>Adobe Connect Central Login</title>\r\n'
+    b'<meta http-equiv="X-UA-Compatible" content="IE=edge">\r\n'
+    b'<script src="/common/scripts/showContent.js?ver=10.8.0"></script>'
+    b'<script type="text/javascript" src="/common/scripts/breezeUI.js?ver=10.8.0">'
+    b'</script>\r\n</head><body><form name="login"></form></body></html>'
+)
+
+HOLDING_PAGE = (
+    b'<html><head><title>Please wait</title></head>'
+    b'<body>Your recording is being prepared.</body></html>'
+)
+
+
+class _FakeResponse:
+    def __init__(self, body, content_type):
+        self._buf = io.BytesIO(body)
+        self.headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
+
+    def read(self, n=-1):
+        return self._buf.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    """Just enough ConnectClient for fetch._try_download."""
+
+    def __init__(self, body, content_type="text/html;charset=UTF-8"):
+        self.body, self.content_type = body, content_type
+        self.calls = 0
+
+    def _open(self, url, **kw):
+        self.calls += 1
+        return _FakeResponse(self.body, self.content_type)
+
+
+class TestLoginPageDetection(unittest.TestCase):
+    def test_recognises_the_real_login_page(self):
+        self.assertTrue(looks_like_login_page(LOGIN_PAGE))
+
+    def test_holding_page_is_not_a_login_page(self):
+        # Must stay False, or a genuinely-still-building zip would abort early.
+        self.assertFalse(looks_like_login_page(HOLDING_PAGE))
+
+    def test_zip_bytes_are_not_a_login_page(self):
+        self.assertFalse(looks_like_login_page(b"PK\x03\x04" + os.urandom(64)))
+
+
+class TestDownloadFailsFastOnLogin(unittest.TestCase):
+    """The bug: a login page was read as 'still preparing' and polled for 30 min."""
+
+    def test_login_page_aborts_immediately(self):
+        client = _FakeClient(LOGIN_PAGE)
+        link = parse_link("https://acc.example.edu/l3fw0y0rs38h/")
+        with TempRecording() as rec:
+            with self.assertRaises(AuthError) as caught:
+                download_recording(
+                    client, link, rec.path, poll_timeout=300, poll_interval=15,
+                )
+        message = str(caught.exception)
+        self.assertIn("login page", message)
+        self.assertIn("--session", message)
+        # One candidate URL, one request - not a poll loop.
+        self.assertEqual(client.calls, 1)
+
+    def test_holding_page_still_polls_then_gives_up(self):
+        client = _FakeClient(HOLDING_PAGE)
+        link = parse_link("https://acc.example.edu/p8fj3k2la9x/")
+        with TempRecording() as rec:
+            with self.assertRaises(ConnectError) as caught:
+                download_recording(
+                    client, link, rec.path, poll_timeout=1, poll_interval=0,
+                )
+        # A real holding page must NOT be treated as an auth failure - it is
+        # retried, and only the timeout ends the run.
+        self.assertNotIsInstance(caught.exception, AuthError)
+        self.assertGreaterEqual(client.calls, len(_MP4_CANDIDATES) + len(_ZIP_CANDIDATES))
+        self.assertIn("could not obtain a downloadable recording", str(caught.exception))
+
+
+class _Args:
+    """Stand-in for the argparse namespace _client() reads."""
+
+    def __init__(self, **kw):
+        self.url = kw.pop("url", "https://acc.example.edu/l3fw0y0rs38h/")
+        self.session = kw.pop("session", None)
+        self.user = kw.pop("user", None)
+        self.password = kw.pop("password", None)
+        self.insecure = kw.pop("insecure", True)
+        self.__dict__.update(kw)
+
+
+class TestInvalidSessionIsReported(unittest.TestCase):
+    """The bug: an expired BREEZESESSION behaved exactly like passing nothing."""
+
+    def test_session_that_is_not_logged_in_raises(self):
+        # check_session() returns None for a cookie the server treats as
+        # anonymous - which is what an expired cookie looks like.
+        with mock.patch.object(ConnectClient, "check_session", return_value=None):
+            with self.assertRaises(AuthError) as caught:
+                _client(_Args(session="BOGUS123"))
+        self.assertIn("expired", str(caught.exception))
+
+    def test_valid_session_is_accepted(self):
+        with mock.patch.object(ConnectClient, "check_session", return_value="me@x.edu"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                client, link = _client(_Args(session="GOOD"))
+        self.assertEqual(link.url_path, "l3fw0y0rs38h")
+
+
+class TestCliEntryPoints(unittest.TestCase):
+    """The bug: cli.py had no __main__ guard, so this printed nothing, exit 0."""
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", *args, "--help"],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_module_and_package_entry_points_both_print_usage(self):
+        for target in ("connect_dl", "connect_dl.cli"):
+            with self.subTest(target=target):
+                result = self._run(target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage: connect-dl", result.stdout)
+                self.assertIn("get", result.stdout)
 
 
 if __name__ == "__main__":

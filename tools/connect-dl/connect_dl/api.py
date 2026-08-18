@@ -34,7 +34,29 @@ from .urls import ConnectLink
 
 log = logging.getLogger(__name__)
 
-__all__ = ["ConnectClient", "ConnectError", "AuthError", "Recording"]
+__all__ = [
+    "ConnectClient", "ConnectError", "AuthError", "Recording",
+    "looks_like_login_page",
+]
+
+# Connect answers an unauthenticated asset request with HTTP 200 and the
+# Connect Central login page rather than a 401/403.  Observed on Connect
+# 10.8.0.  Without this check the download poll loop reads that page as "the
+# server is still building the zip" and retries for the full poll timeout.
+_LOGIN_MARKERS = (
+    b"adobe connect central login",
+    b"/common/scripts/breezeui.js",
+    b'name="login"',
+    b"session-timeout",
+)
+
+
+def looks_like_login_page(raw: bytes) -> bool:
+    """True if ``raw`` is the start of Connect's HTML login page."""
+    head = raw[:4096].lower()
+    if b"<html" not in head and not head.lstrip().startswith(b"<"):
+        return False
+    return any(marker in head for marker in _LOGIN_MARKERS)
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "

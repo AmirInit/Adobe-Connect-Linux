@@ -23,7 +23,7 @@ import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 
-from .api import ConnectClient, ConnectError
+from .api import AuthError, ConnectClient, ConnectError, looks_like_login_page
 from .urls import ConnectLink
 
 log = logging.getLogger(__name__)
@@ -129,15 +129,29 @@ def _try_download(
 
         head = response.read(len(_ZIP_MAGIC))
 
-        if kind == "zip":
-            if head != _ZIP_MAGIC:
-                # Almost always an HTML holding page while the zip is built.
-                rest = response.read(400)
-                snippet = (head + rest).decode("utf-8", "replace").strip()[:120]
+        if "html" in content_type or head.startswith(b"<"):
+            body = head + response.read(4096)
+            # A login page is a permanent answer, not a holding page.  Raising
+            # here stops the caller polling for the full timeout against a
+            # server that will never hand this account the file.
+            if looks_like_login_page(body):
+                raise AuthError(
+                    f"{url}\n"
+                    "  the server answered with the Adobe Connect login page, so this "
+                    "recording is not public and no valid session was supplied.\n"
+                    "  Pass credentials with -u/--user, or copy the BREEZESESSION "
+                    "cookie out of a logged-in browser and pass --session "
+                    "(required for SSO/Shibboleth accounts)."
+                )
+            snippet = body.decode("utf-8", "replace").strip()[:120]
+            if kind == "zip":
                 return False, f"not a zip yet (content-type {content_type!r}: {snippet!r})"
-        else:
-            if "html" in content_type or head.startswith(b"<"):
-                return False, f"not an mp4 (content-type {content_type!r})"
+            return False, f"not an mp4 (content-type {content_type!r})"
+
+        if kind == "zip" and head != _ZIP_MAGIC:
+            rest = response.read(400)
+            snippet = (head + rest).decode("utf-8", "replace").strip()[:120]
+            return False, f"not a zip yet (content-type {content_type!r}: {snippet!r})"
 
         tmp = target.with_suffix(target.suffix + ".part")
         written = len(head)
