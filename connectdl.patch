@@ -1,0 +1,3622 @@
+From 57249498bdc523c7aa61b89584bef0138010d13f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 17 Aug 2026 23:30:53 +0000
+Subject: [PATCH] Add connect-dl recording downloader; fix client shutdown
+ abort
+
+The repository could join a live meeting but had no way to get at a recorded
+one. tools/connect-dl downloads a recording and rebuilds it into playable
+files, with the lecturer's audio as the deliverable that must not fail.
+
+Adobe Connect does not hand out a video file. A recording is a set of
+independent Flash-era streams - shared screen, webcam, one FLV per stretch of
+microphone audio - with no manifest an ordinary player understands, so the
+streams have to be identified and placed on a common timeline first.
+
+  urls/api/fetch  link parsing for every shape a Connect URL takes, the XML
+                  API (including the Enhanced Security session swap after
+                  login), and the poll loop for the on-demand
+                  output/...zip?download=zip archive.
+  flv             a direct FLV reader. Connect's own duration metadata is
+                  frequently absent or wrong, so codecs and timestamp spans
+                  come from the container. Tag headers only, so it stays fast
+                  on gigabyte files.
+  archive         classifies the streams and resolves each one's start time
+                  from the recording XML, the FLV timestamps, or - last
+                  resort - file order, reporting which rule applied.
+  media           one ffmpeg pass per output. Audio segments are delayed onto
+                  their true positions and mixed, so a break in the middle of
+                  a lecture stays a silence instead of being closed up.
+  player          an offline page with the shared screen, chapters and chat,
+                  and the playback speed control Connect never offered.
+
+Alignment is decided once per archive rather than per file: a single non-zero
+start anywhere means Connect stamped the streams with their real meeting
+positions, so a zero elsewhere genuinely means "from the beginning". Reading
+that per file instead treats a zero as unknown and appends the first half of
+the lecture behind the second - covered by a regression test.
+
+Also fixes, in the existing client:
+
+- main.cpp ran its X11 event loop on a std::thread that was neither joined
+  nor detached, so the destructor called std::terminate and a clean quit
+  aborted. That thread also drove Xlib from a second thread without
+  XInitThreads and tore the display down underneath the running CEF loop.
+  Polling X from the single loop removes all three problems.
+- the loop slept for ((1000 / 30) / 1000) seconds - integer division, so
+  sleep(0) - and spun a core at 100% for the whole meeting.
+- MyApp.h and MyClient.h had no include guards, and MyClient.h defined its
+  constructor out of line, so a second includer would not link.
+- MyClient inherited CefLifeSpanHandler but never returned it from
+  GetLifeSpanHandler, leaving the base inert.
+- the cache path came from getlogin(), which is the wrong user under sudo and
+  fails with no tty; $HOME is used first now.
+- install.sh rewrote open.sh and connect.desktop in the source tree with sed
+  -i, consuming the INSTALL_PATH placeholder so a second run silently kept
+  the first run's path. The files are generated instead.
+
+README documents why CEF stays pinned at 86: Chromium dropped the PPAPI Flash
+interface in 88 and the classic meeting room is a Flash application, so
+upgrading would build and then fail to load any meeting. connect-dl uses
+neither CEF nor Flash, so recordings are unaffected.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WbvpE7m9W5mWiGPxqtHFUL
+---
+ .gitignore                                |   4 +
+ MyApp.h                                   |  11 +-
+ MyClient.h                                |  22 +-
+ README.md                                 |  36 ++-
+ install.sh                                |  86 +++--
+ main.cpp                                  | 152 ++++++---
+ tools/connect-dl/README.md                | 151 +++++++++
+ tools/connect-dl/connect-dl               |  11 +
+ tools/connect-dl/connect_dl/__init__.py   |   3 +
+ tools/connect-dl/connect_dl/__main__.py   |   6 +
+ tools/connect-dl/connect_dl/api.py        | 257 +++++++++++++++
+ tools/connect-dl/connect_dl/archive.py    | 375 ++++++++++++++++++++++
+ tools/connect-dl/connect_dl/cli.py        | 375 ++++++++++++++++++++++
+ tools/connect-dl/connect_dl/fetch.py      | 186 +++++++++++
+ tools/connect-dl/connect_dl/flv.py        | 251 +++++++++++++++
+ tools/connect-dl/connect_dl/index.py      | 172 ++++++++++
+ tools/connect-dl/connect_dl/media.py      | 372 +++++++++++++++++++++
+ tools/connect-dl/connect_dl/player.py     | 359 +++++++++++++++++++++
+ tools/connect-dl/connect_dl/urls.py       | 151 +++++++++
+ tools/connect-dl/pyproject.toml           |  13 +
+ tools/connect-dl/tests/test_connect_dl.py | 281 ++++++++++++++++
+ 21 files changed, 3192 insertions(+), 82 deletions(-)
+ create mode 100644 tools/connect-dl/README.md
+ create mode 100755 tools/connect-dl/connect-dl
+ create mode 100644 tools/connect-dl/connect_dl/__init__.py
+ create mode 100644 tools/connect-dl/connect_dl/__main__.py
+ create mode 100644 tools/connect-dl/connect_dl/api.py
+ create mode 100644 tools/connect-dl/connect_dl/archive.py
+ create mode 100644 tools/connect-dl/connect_dl/cli.py
+ create mode 100644 tools/connect-dl/connect_dl/fetch.py
+ create mode 100644 tools/connect-dl/connect_dl/flv.py
+ create mode 100644 tools/connect-dl/connect_dl/index.py
+ create mode 100644 tools/connect-dl/connect_dl/media.py
+ create mode 100644 tools/connect-dl/connect_dl/player.py
+ create mode 100644 tools/connect-dl/connect_dl/urls.py
+ create mode 100644 tools/connect-dl/pyproject.toml
+ create mode 100644 tools/connect-dl/tests/test_connect_dl.py
+
+diff --git a/.gitignore b/.gitignore
+index 33e010f..e1fda12 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,3 +28,7 @@ repo
+ *.yml
+ flatpak_connect.desktop
+ connect-test
++
++# Python
++__pycache__/
++*.pyc
+diff --git a/MyApp.h b/MyApp.h
+index 55e9bfa..6a5fecd 100644
+--- a/MyApp.h
++++ b/MyApp.h
+@@ -1,7 +1,10 @@
++#ifndef ADOBE_CONNECT_MYAPP_H_
++#define ADOBE_CONNECT_MYAPP_H_
++
+ #include "include/cef_app.h"
+-#include "include/wrapper/cef_helpers.h"
++
+ class MyApp : public CefApp, public CefRenderProcessHandler
+-{    
++{
+ public:
+     MyApp();
+     CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override
+@@ -10,4 +13,6 @@ public:
+     }
+     void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override;
+     IMPLEMENT_REFCOUNTING(MyApp);
+-};
+\ No newline at end of file
++};
++
++#endif  // ADOBE_CONNECT_MYAPP_H_
+diff --git a/MyClient.h b/MyClient.h
+index b281e29..5d3cea4 100644
+--- a/MyClient.h
++++ b/MyClient.h
+@@ -1,14 +1,22 @@
+-#include "include/cef_app.h"
++#ifndef ADOBE_CONNECT_MYCLIENT_H_
++#define ADOBE_CONNECT_MYCLIENT_H_
++
+ #include "include/cef_client.h"
+-#include "include/wrapper/cef_helpers.h"
++
+ class MyClient : public CefClient, public CefLifeSpanHandler
+ {
++public:
++    MyClient() = default;
++
++    // Without this, the CefLifeSpanHandler base is inert: CefClient's default
++    // returns null, so none of its callbacks are ever delivered.
++    CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override
++    {
++        return this;
++    }
++
+ private:
+     IMPLEMENT_REFCOUNTING(MyClient);
+-public:
+-    MyClient();
+ };
+ 
+-MyClient::MyClient()
+-{
+-}
+\ No newline at end of file
++#endif  // ADOBE_CONNECT_MYCLIENT_H_
+diff --git a/README.md b/README.md
+index 1b9eb91..45191c3 100644
+--- a/README.md
++++ b/README.md
+@@ -3,7 +3,16 @@
+ This project is an unofficial Linux client for the Adobe Connect meeting application
+ 
+ Adobe Connect does not have a linux version officially, however, since it's written in flash, it's possible to run it in a browser. This project, uses an underlying chromium browser with flash support to run the flash file behind the meetings. It provides the binding necessary to automatically launch the app just like the Windows version for convenience.
+-This project uses [Chromium Embedded Framework](https://github.com/chromiumembedded) to utlize the underlying browser
++This project uses [Chromium Embedded Framework](https://github.com/chromiumembedded) to utilize the underlying browser
++
++> **A note on Flash.** The live-meeting client is pinned to CEF 86 (Chromium 86)
++> on purpose: Chromium removed the PPAPI Flash plugin interface in version 88,
++> and the classic Adobe Connect meeting room is a Flash application. Upgrading
++> CEF would build fine and then fail to load any meeting, so the pin stays until
++> the target server is migrated to Connect's HTML client. This affects **live
++> meetings only** — `tools/connect-dl` does not use CEF or Flash at all, so
++> downloading and replaying recordings is unaffected.
++
+ 
+ ![Alt text](preview.png?raw=true "Preview Image")
+ (an Ubuntu desktop running Adobe Connect Linux)
+@@ -40,6 +49,31 @@ Example:
+ ```
+ 
+ *Note: The `--ignore-certificate-errors` flag is hardcoded internally to bypass strict DPI/firewall SSL interceptions, meaning you do not need to pass it manually.*
++## Downloading recordings
++
++Joining a live class is only half of what this repository is for. `tools/connect-dl`
++downloads a **recorded** class and rebuilds it into files you can actually play —
++above all a single continuous audio track of the lecturer's voice, which you can
++then listen to at any speed.
++
++```bash
++sudo apt install ffmpeg          # the one external dependency
++
++# download a recording and rebuild it
++./tools/connect-dl/connect-dl get "https://connect.example.edu/p8fj3k2la9x/" \
++    -u you@example.edu -o ./class07
++```
++
++You get the lecture as an `.mp3`, a reconstructed `.mp4` of the shared screen
++with the webcam and audio, and a `play.html` offline player with a **playback
++speed control** (0.75×–4×, pitch-corrected) plus chapter and chat sidebars —
++the thing Connect's own player never offered.
++
++Signing in through university SSO? Copy the `BREEZESESSION` cookie out of a
++logged-in browser and pass `--session`. Full documentation, including how to fix
++a stream that plays out of sync, is in
++[tools/connect-dl/README.md](tools/connect-dl/README.md).
++
+ ## FAQ
+ If the app does not open, try the following command:
+ ```
+diff --git a/install.sh b/install.sh
+index 63da025..37b1af1 100755
+--- a/install.sh
++++ b/install.sh
+@@ -1,26 +1,62 @@
+ #!/bin/bash
+-shopt -s extglob
+-echo "Downloading Flash Player..." &&
+-mkdir .flash &&
+-cd .flash &&
+-wget "https://github.com/darktohka/clean-flash-builds/releases/download/v1.7/flash_player_patched_ppapi_linux.x86_64.tar.gz" -O ./flash.tar.gz &&
+-tar -xzf flash.tar.gz &&
+-mkdir -p $HOME/.local/lib/flash &&
+-cp ./libpepflashplayer.so $HOME/.local/lib/flash/ &&
+-cd .. &&
+-rm -r .flash/ &&
+-echo "Copying files..." &&
+-INSTALL_PATH="${INSTALL_DIRECTORY:-$HOME/.local/share/adobe-connect}" &&
+-rm -rf "$INSTALL_PATH" &&
+-mkdir -p "$INSTALL_PATH" &&
+-sed -i "s|INSTALL_PATH|$INSTALL_PATH|g" open.sh &&
+-cp -r !(install.sh) "$INSTALL_PATH" &&
+-chmod +x "$INSTALL_PATH/open.sh" "$INSTALL_PATH/connect"
+-echo "Creating URL Scheme handlers..."
+-sed -i "s|INSTALL_PATH|$INSTALL_PATH|g" connect.desktop &&
+-mkdir -p "$HOME/.local/share/applications" &&
+-cp connect.desktop "$HOME/.local/share/applications/" &&
+-mkdir -p "$HOME/.config" &&
+-xdg-mime default connect.desktop x-scheme-handler/connectpro &&
+-update-desktop-database "$HOME/.local/share/applications" || true &&
+-echo "Done!"
++# User-space installer.  Needs no root: everything lands under $HOME.
++set -euo pipefail
++
++INSTALL_PATH="${INSTALL_DIRECTORY:-$HOME/.local/share/adobe-connect}"
++FLASH_DIR="$HOME/.local/lib/flash"
++FLASH_URL="https://github.com/darktohka/clean-flash-builds/releases/download/v1.7/flash_player_patched_ppapi_linux.x86_64.tar.gz"
++SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++# --- Flash Player ------------------------------------------------------------
++# Adobe Connect's classic meeting client is a Flash application, so the plugin
++# is still required.  Skip the download when it is already in place.
++if [ -f "$FLASH_DIR/libpepflashplayer.so" ] && [ -z "${FORCE_FLASH_DOWNLOAD:-}" ]; then
++    echo "Flash Player already present in $FLASH_DIR, skipping download."
++else
++    echo "Downloading Flash Player..."
++    TMP_FLASH="$(mktemp -d)"
++    trap 'rm -rf "$TMP_FLASH"' EXIT
++    wget -q --show-progress "$FLASH_URL" -O "$TMP_FLASH/flash.tar.gz"
++    tar -xzf "$TMP_FLASH/flash.tar.gz" -C "$TMP_FLASH"
++    mkdir -p "$FLASH_DIR"
++    cp "$TMP_FLASH/libpepflashplayer.so" "$FLASH_DIR/"
++fi
++
++# --- Application files -------------------------------------------------------
++echo "Installing to $INSTALL_PATH..."
++rm -rf "$INSTALL_PATH"
++mkdir -p "$INSTALL_PATH"
++
++# Copy everything except the installer and the templates that need expanding.
++# Earlier versions ran `sed -i` over open.sh and connect.desktop in the source
++# tree, which consumed the INSTALL_PATH placeholder: a second run - or a run
++# with a different INSTALL_DIRECTORY - silently kept the first run's path.
++# Generating the files instead leaves the source tree untouched and repeatable.
++for entry in "$SRC_DIR"/* "$SRC_DIR"/.[!.]*; do
++    [ -e "$entry" ] || continue
++    case "$(basename "$entry")" in
++        install.sh|open.sh|connect.desktop|tools|.git|.github|.vscode|CEF|include) continue ;;
++    esac
++    cp -r "$entry" "$INSTALL_PATH"/
++done
++
++sed "s|INSTALL_PATH|$INSTALL_PATH|g" "$SRC_DIR/open.sh" > "$INSTALL_PATH/open.sh"
++chmod +x "$INSTALL_PATH/open.sh"
++if [ -f "$INSTALL_PATH/connect" ]; then
++    chmod +x "$INSTALL_PATH/connect"
++else
++    echo "Note: the 'connect' binary is not here yet - run ./make.sh first," >&2
++    echo "      or install from a release tarball." >&2
++fi
++
++# --- URL scheme handler ------------------------------------------------------
++echo "Registering the connectpro:// URL handler..."
++mkdir -p "$HOME/.local/share/applications"
++sed "s|INSTALL_PATH|$INSTALL_PATH|g" "$SRC_DIR/connect.desktop" \
++    > "$HOME/.local/share/applications/connect.desktop"
++
++xdg-mime default connect.desktop x-scheme-handler/connectpro || true
++update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
++
++echo "Done. Launch a meeting with:"
++echo "  $INSTALL_PATH/connect \"connectpro://YOUR_MEETING_URL\""
+diff --git a/main.cpp b/main.cpp
+index 9918990..bed8cb8 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -2,57 +2,72 @@
+ #include "include/wrapper/cef_helpers.h"
+ #include "MyApp.h"
+ #include "MyClient.h"
+-#include <unistd.h>
+ #include <X11/X.h>
+ #include <X11/Xutil.h>
++#include <chrono>
++#include <cstring>
+ #include <iostream>
++#include <pwd.h>
+ #include <thread>
++#include <unistd.h>
+ using namespace std;
+ 
+-CefRefPtr<CefBrowser> browser;
+-Display *main_display;
+-Window window_xid;
+-Window child_window;
+-
+-volatile bool isOpen = true;
++namespace {
+ 
+-void event_loop()
++CefRefPtr<CefBrowser> browser;
++Display *main_display = nullptr;
++Window window_xid = 0;
++Window child_window = 0;
++Atom wm_delete_message = 0;
++
++bool isOpen = true;
++
++// Roughly 60 Hz.  The original slept for ((1000 / 30) / 1000) seconds, which is
++// integer arithmetic for sleep(0) - the process spun a core at 100% for the
++// whole meeting.
++constexpr auto kFrameDelay = chrono::milliseconds(16);
++
++// Drain whatever X11 has queued without blocking.
++//
++// This used to run on a second thread blocked in XNextEvent.  That was a
++// problem in three ways: Xlib was being called from two threads without
++// XInitThreads, the thread tore the display down underneath the still-running
++// CEF loop, and - because the std::thread was neither joined nor detached - its
++// destructor called std::terminate when main returned, so a clean quit aborted.
++// Polling from the one loop removes all three.
++void pump_x_events()
+ {
+-    Atom wmDeleteMessage = XInternAtom(main_display, "WM_DELETE_WINDOW", False);
+-    XSetWMProtocols(main_display, window_xid, &wmDeleteMessage, 1);
+-    XEvent event;
+-    while (true)
++    while (main_display && XPending(main_display))
+     {
++        XEvent event;
+         XNextEvent(main_display, &event);
++
+         if (event.type == ClientMessage)
+         {
+-            if (event.xclient.data.l[0] == wmDeleteMessage)
++            if (static_cast<Atom>(event.xclient.data.l[0]) == wm_delete_message)
+             {
+                 isOpen = false;
+-                browser->GetHost()->CloseBrowser(true);
+-                XDestroySubwindows(main_display, window_xid);
+-                XDestroyWindow(main_display, window_xid);
+-                XCloseDisplay(main_display);
+-                break;
++                return;
+             }
+         }
+         else if (event.type == ConfigureNotify)
+         {
+-            auto ce = event.xconfigure;
+-            XResizeWindow(main_display, child_window, ce.width, ce.height);
+-            browser->GetHost()->WasResized();
++            const auto ce = event.xconfigure;
++            if (child_window)
++                XResizeWindow(main_display, child_window, ce.width, ce.height);
++            if (browser)
++                browser->GetHost()->WasResized();
+         }
+         else if (event.type == MappingNotify)
+         {
+             XRefreshKeyboardMapping(&event.xmapping);
+         }
+     }
+-    return;
+ }
+ 
+ void maximizeWindow(Window win, Display *display)
+ {
+-    XEvent ev;
++    XEvent ev = {};
+     ev.xclient.window = win;
+     ev.xclient.type = ClientMessage;
+     ev.xclient.format = 32;
+@@ -62,9 +77,26 @@ void maximizeWindow(Window win, Display *display)
+     ev.xclient.data.l[2] = XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_VERT", False);
+     ev.xclient.data.l[3] = 1;
+ 
+-    XSendEvent(display, DefaultRootWindow(display), False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
++    XSendEvent(display, DefaultRootWindow(display), False,
++               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
++}
++
++// $HOME is what every other tool honours; getlogin() reports the owner of the
++// controlling terminal, which is the wrong user under su/sudo and fails
++// outright when there is no tty (launched from a .desktop file, for instance).
++string user_config_dir()
++{
++    if (const char *home = getenv("HOME"); home && *home)
++        return string(home) + "/.config/";
++
++    if (const passwd *pw = getpwuid(getuid()); pw && pw->pw_dir && *pw->pw_dir)
++        return string(pw->pw_dir) + "/.config/";
++
++    return "/tmp/.config/";
+ }
+ 
++}  // namespace
++
+ int main(int argc, char *argv[])
+ {
+     CefMainArgs main_args(argc, argv);
+@@ -89,7 +121,8 @@ int main(int argc, char *argv[])
+     }
+ 
+     if (launch_args.empty()) {
+-        cerr << "Error: No connectpro:// URL provided. Exiting." << endl;
++        cerr << "Error: No connectpro:// URL provided." << endl;
++        cerr << "Usage: connect \"connectpro://YOUR_MEETING_URL\"" << endl;
+         return 1;
+     }
+ 
+@@ -99,18 +132,7 @@ int main(int argc, char *argv[])
+ 
+     CefRefPtr<MyClient> cefclient(new MyClient);
+ 
+-    const char* user_login = getlogin();
+-    string cache_path;
+-    if (user_login) {
+-        cache_path = "/home/" + string(user_login) + "/.config/";
+-    } else {
+-        const char* home_env = getenv("HOME");
+-        if (home_env) {
+-            cache_path = string(home_env) + "/.config/";
+-        } else {
+-            cache_path = "/tmp/.config/";
+-        }
+-    }
++    const string cache_path = user_config_dir();
+     CefString(&settings.root_cache_path).FromString(cache_path);
+     CefString(&settings.cache_path).FromString(cache_path + "adobe_connect/cache");
+ 
+@@ -128,38 +150,76 @@ int main(int argc, char *argv[])
+     ctx->SetPreference("profile.default_content_setting_values.plugins", val, err);
+     ctx->SetPreference("plugins.run_all_flash_in_allow_mode", val, err);
+ 
+-    main_display = XOpenDisplay(0);
++    // Must precede every other Xlib call: CEF drives X from its own threads.
++    XInitThreads();
++
++    main_display = XOpenDisplay(nullptr);
++    if (!main_display) {
++        cerr << "Error: cannot open an X display. This app needs a running X "
++                "session (under Wayland, an XWayland one)." << endl;
++        CefShutdown();
++        return 1;
++    }
++
+     Window root_window = XDefaultRootWindow(main_display);
+     window_xid = XCreateWindow(main_display, root_window, 10, 10, 800, 600, 10, CopyFromParent, InputOutput, CopyFromParent, 0, nullptr);
+     XMapWindow(main_display, window_xid);
+     XFlush(main_display);
+     XSelectInput(main_display, window_xid, StructureNotifyMask | PropertyChangeMask | SubstructureNotifyMask);
+     XStoreName(main_display, window_xid, "Adobe Connect");
++
++    wm_delete_message = XInternAtom(main_display, "WM_DELETE_WINDOW", False);
++    XSetWMProtocols(main_display, window_xid, &wm_delete_message, 1);
++
+     window_info.SetAsChild(window_xid, CefRect(0, 0, 800, 600));
+ 
+     browser_settings.application_cache = cef_state_t::STATE_ENABLED;
+     CefString(&window_info.window_name).FromString("Adobe Connect");
+ 
+     browser = CefBrowserHost::CreateBrowserSync(window_info, cefclient, launch_args.substr(11), browser_settings, nullptr, ctx);
++    if (!browser) {
++        cerr << "Error: failed to create the browser window." << endl;
++        XDestroyWindow(main_display, window_xid);
++        XCloseDisplay(main_display);
++        CefShutdown();
++        return 1;
++    }
+ 
+     child_window = browser->GetHost()->GetWindowHandle();
+ 
+-    XClassHint *hint = XAllocClassHint();
+-    const char *name = "Adobe Connect";
+-    hint->res_class = strdup(name);
+-    hint->res_name = strdup(name);
+-    XSetClassHint(main_display, window_xid, hint);
++    if (XClassHint *hint = XAllocClassHint()) {
++        char name[] = "Adobe Connect";
++        hint->res_class = name;
++        hint->res_name = name;
++        XSetClassHint(main_display, window_xid, hint);
++        XFree(hint);  // the original strdup'd both names and leaked them
++    }
+ 
+     maximizeWindow(window_xid, main_display);
+ 
+-    thread event_loop_thread(event_loop);
+-
+     while (isOpen)
+     {
++        pump_x_events();
+         CefDoMessageLoopWork();
+-        sleep((1000 / 30) / 1000);
++        this_thread::sleep_for(kFrameDelay);
+     }
+ 
++    // Shut down in order: browser first, then our window, then CEF.
++    browser->GetHost()->CloseBrowser(true);
++    // Give CEF a few frames to finish tearing the browser down before the
++    // window it is parented to disappears.  CEF 86 exposes no "is it gone yet"
++    // predicate, so this is a bounded wait rather than a poll.
++    for (int i = 0; i < 30; ++i) {
++        CefDoMessageLoopWork();
++        this_thread::sleep_for(kFrameDelay);
++    }
++    browser = nullptr;
++
++    XDestroySubwindows(main_display, window_xid);
++    XDestroyWindow(main_display, window_xid);
++    XCloseDisplay(main_display);
++    main_display = nullptr;
++
+     CefShutdown();
+     return 0;
+ }
+diff --git a/tools/connect-dl/README.md b/tools/connect-dl/README.md
+new file mode 100644
+index 0000000..0a8c793
+--- /dev/null
++++ b/tools/connect-dl/README.md
+@@ -0,0 +1,151 @@
++# connect-dl
++
++Downloads an Adobe Connect class recording and rebuilds it into files you can
++actually play — most importantly **one continuous audio track of the lecturer's
++voice**, which you can then listen to at any speed.
++
++Adobe Connect does not hand you a video file. A recording is stored as a pile of
++separate Flash-era streams — the shared screen, the webcam, each stretch of
++microphone audio — with no manifest a normal media player understands. This tool
++fetches them, works out where each one belongs on the meeting's timeline, and
++reassembles them.
++
++## Requirements
++
++- Python 3.9+ (standard library only — nothing to `pip install`)
++- `ffmpeg`, for decoding Connect's Nellymoser/Speex audio and Flash Screen Video
++
++```bash
++sudo apt install ffmpeg      # Debian/Ubuntu
++sudo dnf install ffmpeg      # Fedora
++sudo pacman -S ffmpeg        # Arch
++```
++
++## Usage
++
++```bash
++# what recordings does this class room have?
++./connect-dl list https://connect.example.edu/l993retztu2a/ -u me@example.edu
++
++# download one and rebuild everything
++./connect-dl get https://connect.example.edu/p8fj3k2la9x/ -u me@example.edu -o ./class07
++
++# just the professor's voice, as quickly as possible
++./connect-dl get https://connect.example.edu/p8fj3k2la9x/ --audio-only -o ./class07
++```
++
++Paste the link exactly as you have it — a recording link, a meeting-room link, or
++the `connectpro://…` URL the desktop client is launched with. If the link points
++at a room rather than a single recording, you are shown the list and asked which
++one you want.
++
++### Signing in
++
++| Situation | What to use |
++|---|---|
++| Ordinary Connect account | `-u you@example.edu` (you are prompted for the password) |
++| University SSO / Shibboleth | `--session BREEZESESSION_VALUE` |
++| Recording is public | nothing |
++
++For SSO accounts the XML login API is not usable at all. Log into Connect in a
++browser, open developer tools → Application → Cookies, copy the value of the
++`BREEZESESSION` cookie, and pass it with `--session`. You can also set
++`CONNECT_SESSION` or `CONNECT_PASSWORD` in the environment instead of typing
++them on the command line.
++
++If the server sits behind an intercepting proxy with a self-signed certificate,
++add `--insecure`.
++
++## What you get
++
++```
++class07/
++├── Signals-and-Systems-Session-7.mp3    the lecturer's voice, one continuous track
++├── Signals-and-Systems-Session-7.mp4    shared screen + webcam + audio
++├── play.html                            offline player with speed control
++└── source/                              the original streams, kept for rebuilding
++```
++
++Open `play.html` in any browser. It reconstructs the parts of the Connect
++playback experience worth having — the shared screen, a chapter list and the chat
++transcript scrolling alongside — and adds the thing Connect's own player does
++not offer: **any playback rate you like**, from 0.75× to 4×, with pitch
++correction so a 2× lecture still sounds like the lecturer. Press <kbd>↑</kbd> and
++<kbd>↓</kbd> to change speed, <kbd>space</kbd> to play, <kbd>J</kbd>/<kbd>L</kbd>
++to skip 30 seconds. Your speed and position are remembered per recording.
++
++If you would rather have a permanently sped-up file — for a phone or a car
++stereo with no speed control — add `--speed 2`.
++
++## Playback speed without any of the above
++
++The `.mp3` is an ordinary audio file. VLC (`[` and `]`), mpv (`[` and `]`),
++or any podcast app will play it at whatever speed you want.
++
++## When the timing looks wrong
++
++The hardest part of rebuilding a recording is working out when each stream
++started, because Connect does not always say. The tool resolves this three ways,
++and tells you which one it used for every stream:
++
++| Source | Meaning |
++|---|---|
++| `xml` | a start time was stated in the recording's own metadata — reliable |
++| `flv-timestamp` | taken from the stream's own timestamps — reliable |
++| `sequential` / `assumed-zero` | **guessed** by laying segments end to end |
++
++Anything marked as guessed is called out in the notes at the end of the run. If
++part of the lecture drifts out of sync, correct it and rebuild — no re-download:
++
++```bash
++./connect-dl inspect ./class07/source                        # see the streams
++./connect-dl rebuild ./class07/source -o ./class07 \
++    --offset cameraVoip_1_2=2670000                          # in milliseconds
++```
++
++## Other options
++
++| Option | Effect |
++|---|---|
++| `--audio-only` | skip video rendering entirely — much faster |
++| `--audio-format m4a\|opus\|wav` | default is `mp3` |
++| `--speed 2` | also write a permanently sped-up audio copy |
++| `--fps 5` | video frame rate; slides need very few (default 5) |
++| `--width/--height` | video canvas size (default 1280×720) |
++| `--no-camera` | leave the webcam out of the video |
++| `--no-player` | skip the HTML player |
++| `--dry-run` | print the ffmpeg commands instead of running them |
++| `-v` / `-vv` | more detail (goes before the subcommand) |
++
++## How it works
++
++1. **Fetch** — Connect builds a zip of a recording's source files on demand at
++   `<recording-url>/output/…zip?download=zip`. The first request usually returns
++   a holding page while the job runs, so the download is a poll loop. Newer
++   HTML-client recordings sometimes offer a finished MP4 instead; that is taken
++   as-is when available.
++2. **Identify** — each FLV is parsed directly (tag headers only, so it is fast
++   even on gigabyte files) to find its codecs and the span of timestamps it
++   covers. Connect's metadata is frequently missing or wrong, so the container
++   is trusted over what it claims.
++3. **Align** — every stream is placed on one timeline. A single non-zero start
++   anywhere in the recording tells us Connect stamped the streams with their
++   real meeting positions; otherwise each segment restarts at zero and they are
++   laid end to end. Getting this backwards does not cause a subtle drift — it
++   reorders halves of the lecture — so it is decided once for the whole archive.
++4. **Render** — one ffmpeg pass per output. Audio segments are delayed onto
++   their true positions and mixed, so a ten-minute break in the middle of a
++   lecture stays a ten-minute silence rather than being closed up.
++
++## Limitations
++
++- Audio recorded through a **telephone bridge** rather than VoIP may not be in
++  the archive at all; only a Connect administrator can retrieve it.
++- Whiteboard annotations, polls and slide *animations* are drawn by the Flash
++  player at playback time from the event stream. The screen-share video is
++  reproduced faithfully; those interactive overlays are not.
++- If the account cannot download source files, the server returns a holding page
++  forever. That is a permissions setting on the recording, not a bug here.
++
++You need to be entitled to the recording — this authenticates as you and fetches
++what you already have access to.
+diff --git a/tools/connect-dl/connect-dl b/tools/connect-dl/connect-dl
+new file mode 100755
+index 0000000..2c8bb61
+--- /dev/null
++++ b/tools/connect-dl/connect-dl
+@@ -0,0 +1,11 @@
++#!/usr/bin/env python3
++"""Launcher so the tool runs straight from a checkout, with no install step."""
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from connect_dl.cli import main
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/connect-dl/connect_dl/__init__.py b/tools/connect-dl/connect_dl/__init__.py
+new file mode 100644
+index 0000000..1c3818b
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/__init__.py
+@@ -0,0 +1,3 @@
++"""connect-dl - download and rebuild Adobe Connect class recordings."""
++
++__version__ = "1.0.0"
+diff --git a/tools/connect-dl/connect_dl/__main__.py b/tools/connect-dl/connect_dl/__main__.py
+new file mode 100644
+index 0000000..dbdd066
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/__main__.py
+@@ -0,0 +1,6 @@
++import sys
++
++from .cli import main
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/connect-dl/connect_dl/api.py b/tools/connect-dl/connect_dl/api.py
+new file mode 100644
+index 0000000..0a36e9b
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/api.py
+@@ -0,0 +1,257 @@
++"""A small client for the Adobe Connect XML API.
++
++Only the handful of actions needed to find and download a recording are
++implemented.  Everything is stdlib so the tool can be dropped onto a machine and
++run without installing anything.
++
++Two authentication styles are supported:
++
++* **Username / password** — calls ``action=login``.  On servers with Enhanced
++  Security the cookie handed out before login is discarded once the user is
++  authenticated, so a follow-up ``action=common-info`` call is required to pick
++  up the session that actually carries the login.  We always do that second
++  call; it is harmless on servers without the feature.
++* **An existing BREEZESESSION** — copied out of a logged-in browser.  This is
++  the escape hatch for accounts behind SSO/Shibboleth, where the XML login
++  action is not usable at all.
++"""
++
++from __future__ import annotations
++
++import gzip
++import http.cookiejar
++import io
++import logging
++import ssl
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++import xml.etree.ElementTree as ET
++from dataclasses import dataclass, field
++
++from .urls import ConnectLink
++
++log = logging.getLogger(__name__)
++
++__all__ = ["ConnectClient", "ConnectError", "AuthError", "Recording"]
++
++USER_AGENT = (
++    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
++    "Chrome/120.0 Safari/537.36 connect-dl"
++)
++
++
++class ConnectError(RuntimeError):
++    """The server rejected a request or returned something unusable."""
++
++
++class AuthError(ConnectError):
++    """Authentication failed, or the session is not valid (any more)."""
++
++
++@dataclass
++class Recording:
++    """One archived meeting."""
++
++    sco_id: str
++    name: str
++    url_path: str
++    date_created: str | None = None
++    duration: str | None = None
++    folder: str | None = None
++
++    def link(self, origin: str) -> ConnectLink:
++        return ConnectLink(origin=origin, url_path=self.url_path.strip("/"))
++
++    def __str__(self) -> str:  # pragma: no cover - cosmetic
++        bits = [self.name]
++        if self.date_created:
++            bits.append(self.date_created[:10])
++        if self.duration:
++            bits.append(self.duration)
++        return "  ".join(bits)
++
++
++@dataclass
++class ConnectClient:
++    """Authenticated conversation with one Adobe Connect server."""
++
++    origin: str
++    verify_tls: bool = True
++    timeout: int = 60
++    retries: int = 4
++    _jar: http.cookiejar.CookieJar = field(default_factory=http.cookiejar.CookieJar, init=False)
++    _opener: urllib.request.OpenerDirector = field(init=False, repr=False)
++
++    def __post_init__(self) -> None:
++        if self.verify_tls:
++            context = ssl.create_default_context()
++        else:
++            # Deliberately permissive: many university Connect deployments sit
++            # behind middleboxes with self-signed certificates.  Mirrors the
++            # --ignore-certificate-errors the desktop client already hardcodes.
++            context = ssl._create_unverified_context()
++        self._opener = urllib.request.build_opener(
++            urllib.request.HTTPSHandler(context=context),
++            urllib.request.HTTPCookieProcessor(self._jar),
++        )
++        self._opener.addheaders = []
++
++    # ---------------------------------------------------------------- plumbing
++
++    @property
++    def api_url(self) -> str:
++        return f"{self.origin}/api/xml"
++
++    def _open(self, url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None):
++        request = urllib.request.Request(url, data=data)
++        request.add_header("User-Agent", USER_AGENT)
++        request.add_header("Accept-Encoding", "gzip")
++        for key, value in (headers or {}).items():
++            request.add_header(key, value)
++
++        last_error: Exception | None = None
++        for attempt in range(self.retries):
++            try:
++                return self._opener.open(request, timeout=self.timeout)
++            except urllib.error.HTTPError as exc:
++                # 4xx are answers, not transport failures - do not retry them.
++                if exc.code < 500:
++                    raise
++                last_error = exc
++            except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
++                last_error = exc
++            backoff = 2 ** attempt
++            log.warning("request to %s failed (%s), retrying in %ss", url, last_error, backoff)
++            time.sleep(backoff)
++        raise ConnectError(f"could not reach {url}: {last_error}")
++
++    def get_bytes(self, url: str, *, headers: dict[str, str] | None = None) -> tuple[bytes, str]:
++        """Fetch a URL, returning ``(body, content_type)`` with gzip undone."""
++        with self._open(url, headers=headers) as response:
++            raw = response.read()
++            if response.headers.get("Content-Encoding") == "gzip":
++                raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
++            return raw, response.headers.get("Content-Type", "")
++
++    def call(self, action: str, **params: str | None) -> ET.Element:
++        """Invoke an XML API action and return the parsed ``<results>`` root."""
++        query = {"action": action}
++        query.update({k.replace("_", "-"): v for k, v in params.items() if v is not None})
++        url = f"{self.api_url}?{urllib.parse.urlencode(query)}"
++
++        body, _ = self.get_bytes(url)
++        try:
++            root = ET.fromstring(body)
++        except ET.ParseError as exc:
++            raise ConnectError(
++                f"{action}: server did not return XML "
++                f"(got {body[:120]!r}) - is {self.origin} really an Adobe Connect server?"
++            ) from exc
++
++        status = root.find("status")
++        code = status.get("code") if status is not None else None
++        if code and code != "ok":
++            detail = ""
++            if status is not None and len(status):
++                child = status[0]
++                detail = " " + " ".join(f"{k}={v}" for k, v in child.attrib.items())
++            if code in ("no-access", "no-login"):
++                raise AuthError(f"{action}: access denied ({code}{detail})")
++            raise ConnectError(f"{action} failed: {code}{detail}")
++        return root
++
++    # ------------------------------------------------------------------ auth
++
++    @property
++    def session(self) -> str | None:
++        for cookie in self._jar:
++            if cookie.name == "BREEZESESSION":
++                return cookie.value
++        return None
++
++    def set_session(self, value: str) -> None:
++        """Install a BREEZESESSION captured from a browser."""
++        host = urllib.parse.urlparse(self.origin).hostname or ""
++        cookie = http.cookiejar.Cookie(
++            version=0, name="BREEZESESSION", value=value, port=None, port_specified=False,
++            domain=host, domain_specified=True, domain_initial_dot=False,
++            path="/", path_specified=True, secure=False, expires=None, discard=True,
++            comment=None, comment_url=None, rest={},
++        )
++        self._jar.set_cookie(cookie)
++
++    def login(self, username: str, password: str) -> None:
++        """Authenticate, handling the Enhanced Security session swap."""
++        # Seed a session cookie first; Connect expects one to already exist.
++        self.call("common-info")
++        self.call("login", login=username, password=password)
++        # With Enhanced Security the pre-login cookie is invalidated and a new
++        # one is issued here.  Without it, this is a no-op sanity check.
++        info = self.call("common-info")
++        if not self._logged_in(info):
++            raise AuthError(
++                "login appeared to succeed but the session is not authenticated. "
++                "If this account uses SSO, log in with a browser and pass the "
++                "BREEZESESSION cookie via --session instead."
++            )
++        log.info("logged in as %s", username)
++
++    def check_session(self) -> str | None:
++        """Return the logged-in user's login name, or ``None`` if anonymous."""
++        info = self.call("common-info")
++        user = info.find(".//user/login")
++        return user.text if user is not None and user.text else None
++
++    @staticmethod
++    def _logged_in(common_info: ET.Element) -> bool:
++        return common_info.find(".//user") is not None
++
++    # -------------------------------------------------------------- discovery
++
++    def sco_info(self, sco_id: str) -> ET.Element:
++        root = self.call("sco-info", sco_id=sco_id)
++        sco = root.find(".//sco")
++        if sco is None:
++            raise ConnectError(f"sco-info returned no <sco> for id {sco_id}")
++        return sco
++
++    def resolve_url_path(self, url_path: str) -> ET.Element:
++        """Look up a SCO by its public handle (``p8fj3k2la9x``)."""
++        root = self.call("sco-by-url", url_path=f"/{url_path.strip('/')}/")
++        sco = root.find(".//sco")
++        if sco is None:
++            raise ConnectError(f"no SCO found for /{url_path}/")
++        return sco
++
++    def list_recordings(self, folder_sco_id: str) -> list[Recording]:
++        """All archives beneath a folder or meeting room."""
++        root = self.call(
++            "sco-expanded-contents", sco_id=folder_sco_id, filter_icon="archive"
++        )
++        return [self._to_recording(node) for node in root.findall(".//sco")]
++
++    def meeting_recordings(self, meeting_sco_id: str) -> list[Recording]:
++        """Archives belonging to one meeting room."""
++        root = self.call("sco-contents", sco_id=meeting_sco_id, filter_icon="archive")
++        found = [self._to_recording(node) for node in root.findall(".//sco")]
++        if found:
++            return found
++        # Some deployments file recordings under the room rather than in it.
++        return self.list_recordings(meeting_sco_id)
++
++    @staticmethod
++    def _to_recording(node: ET.Element) -> Recording:
++        def text(tag: str) -> str | None:
++            found = node.find(tag)
++            return found.text if found is not None and found.text else None
++
++        return Recording(
++            sco_id=node.get("sco-id", ""),
++            name=text("name") or "(untitled)",
++            url_path=(text("url-path") or node.get("url-path") or "").strip("/"),
++            date_created=text("date-created") or text("date-begin"),
++            duration=text("duration"),
++            folder=node.get("folder-id"),
++        )
+diff --git a/tools/connect-dl/connect_dl/archive.py b/tools/connect-dl/connect_dl/archive.py
+new file mode 100644
+index 0000000..66db9bc
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/archive.py
+@@ -0,0 +1,375 @@
++"""Making sense of the pile of files inside a recording archive.
++
++A Flash-era Adobe Connect recording unzips to something like::
++
++    mainstream.flv / mainstream.xml      the room's composited "main" stream
++    indexstream.flv / indexstream.xml    seek index and pod layout events
++    cameraVoip_1_1.flv                   webcam picture + the microphone audio
++    cameraVoip_1_2.flv                   ...one per start/stop of the mic
++    screenshare_1_1.flv / .flx           whatever was being shared on screen
++    ftchat.xml, sco_metadata.xml, *.swf  chat log, titles, player chrome
++
++The hard part is that each FLV is an independent stream that began at a
++different moment in the meeting, and nothing in the file names says when.  Put
++them on a common timeline wrong and the professor's voice drifts away from the
++slides - or worse, several microphone segments pile up on top of each other.
++
++Offsets are resolved in descending order of trustworthiness:
++
++1. a start time stated for that file in one of the XML sidecars,
++2. the file's own first media timestamp (Connect frequently leaves these as
++   meeting-relative rather than resetting them to zero),
++3. laying the segments end to end in file-name order.
++
++Which rule fired is recorded per stream and printed, because rule 3 is a guess
++and the user may need to correct it with --offset.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import xml.etree.ElementTree as ET
++import zipfile
++from dataclasses import dataclass, field
++from enum import Enum
++from pathlib import Path
++
++from .flv import FlvInfo, scan_flv
++
++log = logging.getLogger(__name__)
++
++__all__ = ["Role", "Stream", "RecordingArchive", "unpack"]
++
++_SEQ_RE = re.compile(r"(\d+)")
++_TIME_ATTRS = ("start", "starttime", "start-time", "begin", "offset", "time", "ts", "timestamp")
++_AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav"}
++
++
++class Role(str, Enum):
++    SCREENSHARE = "screenshare"   # shared screen / slides - the main picture
++    CAMERA = "camera"             # webcam video, usually carries the mic audio
++    VOICE = "voice"               # audio-only stream (VoIP or telephony bridge)
++    MAIN = "main"                 # mainstream.flv, the server's own composite
++    INDEX = "index"               # indexstream.flv, events not media
++    OTHER = "other"
++
++    @property
++    def is_audio_source(self) -> bool:
++        return self in (Role.CAMERA, Role.VOICE, Role.MAIN)
++
++
++@dataclass
++class Stream:
++    path: Path
++    role: Role
++    info: FlvInfo | None = None
++    offset_ms: int = 0
++    offset_source: str = "unresolved"
++
++    @property
++    def name(self) -> str:
++        return self.path.name
++
++    @property
++    def duration_ms(self) -> int:
++        return self.info.duration_ms if self.info else 0
++
++    @property
++    def end_ms(self) -> int:
++        return self.offset_ms + self.duration_ms
++
++    @property
++    def has_audio(self) -> bool:
++        if self.info:
++            return self.info.has_audio
++        return self.path.suffix.lower() in _AUDIO_EXTS
++
++    @property
++    def has_video(self) -> bool:
++        return bool(self.info and self.info.has_video)
++
++    @property
++    def sequence(self) -> tuple[int, ...]:
++        """Numbers embedded in the file name, for ordering segments."""
++        return tuple(int(n) for n in _SEQ_RE.findall(self.path.stem)) or (0,)
++
++    def describe(self) -> str:
++        detail = self.info.describe() if self.info else "(non-FLV)"
++        return (
++            f"{self.name:<28} {self.role.value:<11} @{self.offset_ms / 1000:8.1f}s  "
++            f"{detail}  [{self.offset_source}]"
++        )
++
++
++@dataclass
++class RecordingArchive:
++    root: Path
++    streams: list[Stream] = field(default_factory=list)
++    xml_files: list[Path] = field(default_factory=list)
++    title: str | None = None
++
++    # ------------------------------------------------------------ selection
++
++    def by_role(self, *roles: Role) -> list[Stream]:
++        wanted = set(roles)
++        return sorted(
++            (s for s in self.streams if s.role in wanted),
++            key=lambda s: (s.offset_ms, s.sequence),
++        )
++
++    @property
++    def audio_streams(self) -> list[Stream]:
++        """Everything that could carry the speaker's voice, best sources first.
++
++        Camera/VoIP segments are preferred; ``mainstream`` is only used when
++        there is nothing else, because it is a re-encode of the same audio.
++        """
++        primary = [s for s in self.by_role(Role.CAMERA, Role.VOICE) if s.has_audio]
++        if primary:
++            return primary
++        return [s for s in self.by_role(Role.MAIN) if s.has_audio]
++
++    @property
++    def video_streams(self) -> list[Stream]:
++        primary = [s for s in self.by_role(Role.SCREENSHARE) if s.has_video]
++        if primary:
++            return primary
++        return [s for s in self.by_role(Role.MAIN) if s.has_video]
++
++    @property
++    def camera_streams(self) -> list[Stream]:
++        return [s for s in self.by_role(Role.CAMERA) if s.has_video]
++
++    @property
++    def duration_ms(self) -> int:
++        return max((s.end_ms for s in self.streams if s.role != Role.INDEX), default=0)
++
++    def summary(self) -> str:
++        lines = [f"archive: {self.root}"]
++        if self.title:
++            lines.append(f"title:   {self.title}")
++        lines.append(f"length:  {self.duration_ms / 1000 / 60:.1f} min")
++        lines.append("streams:")
++        lines += ["  " + s.describe() for s in sorted(self.streams, key=lambda s: (s.role.value, s.sequence))]
++        if not self.audio_streams:
++            lines.append("  !! no audio-bearing stream found")
++        return "\n".join(lines)
++
++
++def unpack(payload: Path, dest: Path) -> RecordingArchive:
++    """Analyse a recording, extracting it first if it is still a zip.
++
++    ``payload`` may be a zip file, an already-unpacked directory, or a loose
++    media file; ``dest`` is only used in the zip case.
++    """
++    if payload.is_dir():
++        root = payload
++    elif zipfile.is_zipfile(payload):
++        dest.mkdir(parents=True, exist_ok=True)
++        _safe_extract(payload, dest)
++        root = dest
++    else:
++        root = payload.parent
++
++    archive = RecordingArchive(root=root)
++    _collect(archive, root)
++    _resolve_offsets(archive)
++    archive.title = _find_title(archive)
++    return archive
++
++
++def _safe_extract(zip_path: Path, dest: Path) -> None:
++    """Extract, refusing entries that would escape the destination."""
++    with zipfile.ZipFile(zip_path) as zf:
++        for member in zf.infolist():
++            target = (dest / member.filename).resolve()
++            if not str(target).startswith(str(dest.resolve())):
++                raise ValueError(f"refusing unsafe archive entry {member.filename!r}")
++        zf.extractall(dest)
++    log.info("extracted %s", zip_path.name)
++
++
++def _collect(archive: RecordingArchive, root: Path) -> None:
++    for path in sorted(root.rglob("*")):
++        if not path.is_file():
++            continue
++        suffix = path.suffix.lower()
++        if suffix == ".xml":
++            archive.xml_files.append(path)
++            continue
++        if suffix == ".flv":
++            info = scan_flv(path)
++            role = _classify(path, info)
++            if info.error:
++                log.warning("%s: %s", path.name, info.error)
++            archive.streams.append(Stream(path=path, role=role, info=info))
++        elif suffix in _AUDIO_EXTS:
++            archive.streams.append(Stream(path=path, role=Role.VOICE))
++
++
++def _classify(path: Path, info: FlvInfo) -> Role:
++    stem = path.stem.lower()
++    if stem.startswith("screenshare") or "screen" in stem:
++        return Role.SCREENSHARE
++    if "cameravoip" in stem or stem.startswith("camera"):
++        return Role.CAMERA
++    if "voice" in stem or "voip" in stem or "telephony" in stem or "audio" in stem:
++        return Role.VOICE
++    if stem.startswith("indexstream"):
++        return Role.INDEX
++    if stem.startswith("mainstream"):
++        return Role.MAIN
++    # Unknown name: fall back to what the container actually holds.
++    if info.has_video:
++        return Role.SCREENSHARE if (info.width or 0) >= 800 else Role.CAMERA
++    if info.has_audio:
++        return Role.VOICE
++    return Role.OTHER
++
++
++# ------------------------------------------------------------------ offsets
++
++def _resolve_offsets(archive: RecordingArchive) -> None:
++    hints = _offset_hints(archive.xml_files)
++
++    # Connect writes FLV timestamps one of two ways, and which one is in use
++    # decides how a segment starting at t=0 should be read.
++    #
++    #   meeting-relative : every segment is stamped with its position in the
++    #                      meeting, so 0 genuinely means "from the start".
++    #   per-segment      : every segment restarts at 0, so a 0 says nothing at
++    #                      all and the segments have to be laid end to end.
++    #
++    # A single non-zero start anywhere in the recording settles it: only the
++    # first style can produce one.  Getting this wrong is not a subtle
++    # mis-sync - it reorders halves of the lecture - so it is decided once for
++    # the whole archive rather than per file.
++    media = [s for s in archive.streams if s.info and s.info.ok]
++    meeting_relative = any(s.info.first_media_ts > 0 for s in media)
++    log.info(
++        "stream timestamps look %s",
++        "meeting-relative" if meeting_relative else "per-segment (each restarts at zero)",
++    )
++
++    for stream in archive.streams:
++        key = stream.path.stem.lower()
++        if key in hints:
++            stream.offset_ms = hints[key]
++            stream.offset_source = "xml"
++        elif meeting_relative and stream.info and stream.info.ok:
++            stream.offset_ms = stream.info.first_media_ts
++            stream.offset_source = "flv-timestamp"
++
++    # Anything still unplaced gets laid end to end within its own role, so that
++    # consecutive microphone segments do not stack on top of each other.
++    for role in Role:
++        pending = [s for s in archive.streams if s.role == role and s.offset_source == "unresolved"]
++        if not pending:
++            continue
++        placed = [s for s in archive.streams if s.role == role and s.offset_source != "unresolved"]
++        cursor = max((s.end_ms for s in placed), default=0)
++        for stream in sorted(pending, key=lambda s: s.sequence):
++            stream.offset_ms = cursor
++            stream.offset_source = "sequential" if cursor else "assumed-zero"
++            cursor += stream.duration_ms
++
++    _normalise(archive)
++
++
++def _normalise(archive: RecordingArchive) -> None:
++    """Shift the whole timeline so the recording starts at zero."""
++    considered = [s for s in archive.streams if s.role != Role.INDEX and s.duration_ms > 0]
++    if not considered:
++        return
++    base = min(s.offset_ms for s in considered)
++    if base <= 0:
++        return
++    for stream in archive.streams:
++        stream.offset_ms = max(0, stream.offset_ms - base)
++    log.info("shifted timeline back by %.1fs so the recording starts at zero", base / 1000)
++
++
++def _offset_hints(xml_files: list[Path]) -> dict[str, int]:
++    """Scan the XML sidecars for 'stream X starts at T' statements.
++
++    The schemas differ between Connect versions, so rather than target one
++    layout we look for any element that names an FLV and also carries a
++    time-like attribute.
++    """
++    hints: dict[str, int] = {}
++    for xml_path in xml_files:
++        try:
++            tree = ET.parse(xml_path)
++        except (ET.ParseError, OSError):
++            continue
++        for element in tree.iter():
++            names = _referenced_streams(element)
++            if not names:
++                continue
++            time_ms = _time_from(element)
++            if time_ms is None:
++                continue
++            for name in names:
++                hints.setdefault(name, time_ms)
++    if hints:
++        log.info("found start times for %d stream(s) in the recording XML", len(hints))
++    return hints
++
++
++def _referenced_streams(element: ET.Element) -> list[str]:
++    """FLV base names mentioned by this element's attributes or text."""
++    found = []
++    candidates = list(element.attrib.values())
++    if element.text:
++        candidates.append(element.text)
++    for value in candidates:
++        value = (value or "").strip()
++        if not value or "/" in value and len(value) > 120:
++            continue
++        stem = value.rsplit("/", 1)[-1]
++        if stem.lower().endswith(".flv"):
++            found.append(stem[:-4].lower())
++        elif re.fullmatch(r"(cameraVoip|screenshare|mainstream|indexstream)[\w.-]*", stem, re.I):
++            found.append(stem.lower())
++    return found
++
++
++def _time_from(element: ET.Element) -> int | None:
++    for attr in _TIME_ATTRS:
++        for key, value in element.attrib.items():
++            if key.lower().replace("_", "-") != attr:
++                continue
++            parsed = _to_ms(value)
++            if parsed is not None:
++                return parsed
++    return None
++
++
++def _to_ms(value: str) -> int | None:
++    """Read a time value, guessing between seconds and milliseconds."""
++    try:
++        number = float(value)
++    except (TypeError, ValueError):
++        return None
++    if number < 0:
++        return None
++    # Connect writes stream times in milliseconds.  A bare small number is
++    # ambiguous, but treating "12" as 12ms rather than 12s is the safer error:
++    # it collapses to roughly zero instead of shifting audio by seconds.
++    return int(number)
++
++
++def _find_title(archive: RecordingArchive) -> str | None:
++    for xml_path in archive.xml_files:
++        if "metadata" not in xml_path.name.lower():
++            continue
++        try:
++            tree = ET.parse(xml_path)
++        except (ET.ParseError, OSError):
++            continue
++        for tag in ("name", "title", "displayName"):
++            node = tree.find(f".//{tag}")
++            if node is not None and node.text and node.text.strip():
++                return node.text.strip()
++    return None
+diff --git a/tools/connect-dl/connect_dl/cli.py b/tools/connect-dl/connect_dl/cli.py
+new file mode 100644
+index 0000000..6c34467
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/cli.py
+@@ -0,0 +1,375 @@
++"""Command line entry point."""
++
++from __future__ import annotations
++
++import argparse
++import getpass
++import logging
++import os
++import re
++import sys
++from pathlib import Path
++
++from . import __version__
++from .api import AuthError, ConnectClient, ConnectError, Recording
++from .archive import RecordingArchive, Role, unpack
++from .fetch import download_recording
++from .flv import LEGACY_AUDIO, LEGACY_VIDEO
++from .index import parse_events
++from .media import FFmpegMissing, ensure_ffmpeg, make_speed_variant, render_audio, render_video
++from .player import PlayerSources, write_player
++from .urls import InvalidLink, parse_link
++
++log = logging.getLogger("connect-dl")
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="connect-dl",
++        description="Download an Adobe Connect class recording and rebuild it "
++                    "into files you can actually play - including a single "
++                    "continuous audio track of the lecturer's voice.",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog=EPILOG,
++    )
++    parser.add_argument("--version", action="version", version=f"connect-dl {__version__}")
++    parser.add_argument("-v", "--verbose", action="count", default=0, help="repeat for more detail")
++
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    def auth_options(p: argparse.ArgumentParser) -> None:
++        g = p.add_argument_group("authentication")
++        g.add_argument("-u", "--user", help="Adobe Connect login (email)")
++        g.add_argument("-p", "--password",
++                       help="password; prompted for if omitted, or set CONNECT_PASSWORD")
++        g.add_argument("--session",
++                       help="a BREEZESESSION cookie copied from a logged-in browser. "
++                            "Use this when the account signs in through SSO.")
++        g.add_argument("--insecure", action="store_true",
++                       help="skip TLS certificate checks (for servers behind "
++                            "an intercepting proxy)")
++
++    get = sub.add_parser("get", help="download and rebuild a recording")
++    get.add_argument("url", help="recording or meeting-room link")
++    auth_options(get)
++    _output_options(get)
++    get.add_argument("--keep-source", action="store_true",
++                     help="keep the downloaded zip after unpacking")
++    get.add_argument("--poll-timeout", type=int, default=1800, metavar="SEC",
++                     help="how long to wait for the server to build the archive (default: 1800)")
++
++    rebuild = sub.add_parser("rebuild",
++                             help="rebuild outputs from an already-downloaded archive")
++    rebuild.add_argument("path", type=Path, help="a recording .zip or an unpacked folder")
++    _output_options(rebuild)
++
++    inspect = sub.add_parser("inspect", help="show what a downloaded archive contains")
++    inspect.add_argument("path", type=Path)
++
++    listing = sub.add_parser("list", help="list the recordings in a room or folder")
++    listing.add_argument("url")
++    auth_options(listing)
++
++    return parser
++
++
++def _output_options(p: argparse.ArgumentParser) -> None:
++    g = p.add_argument_group("output")
++    g.add_argument("-o", "--out", type=Path, default=Path("."), metavar="DIR",
++                   help="where to write results (default: current directory)")
++    g.add_argument("--audio-only", action="store_true",
++                   help="skip video rendering; produce just the lecture audio (much faster)")
++    g.add_argument("--no-audio", action="store_true", help="skip the audio mixdown")
++    g.add_argument("--audio-format", default="mp3", choices=("mp3", "m4a", "opus", "wav"))
++    g.add_argument("--speed", type=float, metavar="N",
++                   help="also write a permanently sped-up audio copy, e.g. 2 or 2.5. "
++                        "Only needed for players with no speed control - the "
++                        "generated page can already play at any rate.")
++    g.add_argument("--no-player", action="store_true", help="do not generate the HTML player")
++    g.add_argument("--no-camera", action="store_true",
++                   help="leave the webcam out of the rendered video")
++    g.add_argument("--width", type=int, default=1280, help="video width (default: 1280)")
++    g.add_argument("--height", type=int, default=720, help="video height (default: 720)")
++    g.add_argument("--fps", type=int, default=5,
++                   help="video frame rate; slides need very few (default: 5)")
++    g.add_argument("--offset", action="append", default=[], metavar="NAME=MS",
++                   help="override a stream's start time, e.g. cameraVoip_1_2=2670000. "
++                        "Repeatable.")
++    g.add_argument("--dry-run", action="store_true",
++                   help="print the ffmpeg commands instead of running them")
++
++
++EPILOG = """
++examples:
++  # list what is available in a class room
++  connect-dl list https://connect.example.edu/l993retztu2a/ -u me@example.edu
++
++  # download one recording and rebuild everything
++  connect-dl get https://connect.example.edu/p8fj3k2la9x/ -u me@example.edu -o ./class07
++
++  # just the lecturer's voice, as fast as possible
++  connect-dl get https://connect.example.edu/p8fj3k2la9x/ --session BREEZE... --audio-only
++
++  # the streams are misaligned - nudge one and rebuild without downloading again
++  connect-dl rebuild ./class07/source --offset cameraVoip_1_2=2670000
++"""
++
++
++# ------------------------------------------------------------------ commands
++
++def main(argv: list[str] | None = None) -> int:
++    args = build_parser().parse_args(argv)
++    logging.basicConfig(
++        level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
++        format="%(levelname)s: %(message)s",
++    )
++    try:
++        return {
++            "get": cmd_get, "rebuild": cmd_rebuild,
++            "inspect": cmd_inspect, "list": cmd_list,
++        }[args.command](args)
++    except (ConnectError, InvalidLink, FFmpegMissing, RuntimeError, ValueError) as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    except KeyboardInterrupt:
++        print("\ninterrupted", file=sys.stderr)
++        return 130
++
++
++def _client(args) -> tuple[ConnectClient, object]:
++    link = parse_link(args.url)
++    client = ConnectClient(origin=link.origin, verify_tls=not args.insecure)
++
++    session = args.session or link.session or os.environ.get("CONNECT_SESSION")
++    if session:
++        client.set_session(session)
++        who = client.check_session()
++        log.info("using supplied session%s", f" (logged in as {who})" if who else "")
++    elif args.user:
++        password = args.password or os.environ.get("CONNECT_PASSWORD")
++        if not password:
++            password = getpass.getpass(f"Password for {args.user}: ")
++        client.login(args.user, password)
++    else:
++        log.info("no credentials given; trying anonymously")
++    return client, link
++
++
++def cmd_list(args) -> int:
++    client, link = _client(args)
++    if not link.url_path and not link.sco_id:
++        raise ConnectError("that link does not identify a room or folder")
++
++    sco = client.sco_info(link.sco_id) if link.sco_id else client.resolve_url_path(link.url_path)
++    sco_id = sco.get("sco-id", "")
++    recordings = client.meeting_recordings(sco_id)
++
++    if not recordings:
++        print("no recordings found. The room may have none, or this account may "
++              "not be allowed to see them.")
++        return 1
++
++    print(f"{len(recordings)} recording(s):\n")
++    for rec in recordings:
++        print(f"  {rec}")
++        print(f"     {rec.link(link.origin).base}")
++    return 0
++
++
++def cmd_get(args) -> int:
++    client, link = _client(args)
++    out_dir: Path = args.out
++    source_dir = out_dir / "source"
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    # A room link has no recording of its own; ask which archive is meant.
++    if link.url_path:
++        try:
++            sco = client.resolve_url_path(link.url_path)
++            if (sco.findtext("icon") or sco.get("icon") or "") == "meeting":
++                recordings = client.meeting_recordings(sco.get("sco-id", ""))
++                link = _choose(recordings, link)
++        except (ConnectError, AuthError) as exc:
++            # Anonymous or restricted accounts cannot call the API; the direct
++            # asset download often still works, so carry on.
++            log.info("could not query the API (%s); trying the link directly", exc)
++
++    print(f"downloading {link.base}")
++    result = download_recording(
++        client, link, out_dir, poll_timeout=args.poll_timeout,
++    )
++
++    if not result.is_zip:
++        print(f"\nthe server provided a finished video: {result.path}")
++        print("nothing to reconstruct - open it in any player and set the speed there.")
++        return 0
++
++    archive = unpack(result.path, source_dir)
++    if not args.keep_source:
++        result.path.unlink(missing_ok=True)
++
++    return _produce(archive, args, out_dir)
++
++
++def cmd_rebuild(args) -> int:
++    path: Path = args.path
++    if not path.exists():
++        raise ConnectError(f"{path} does not exist")
++    archive = unpack(path, path.parent / "source")
++    return _produce(archive, args, args.out)
++
++
++def cmd_inspect(args) -> int:
++    path: Path = args.path
++    archive = unpack(path, path.parent / "source")
++    print(archive.summary())
++    events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
++    print(f"\nchapters: {len(events.markers)}   chat lines: {len(events.chat)}")
++    return 0
++
++
++# ------------------------------------------------------------------ pipeline
++
++def _choose(recordings: list[Recording], link):
++    if not recordings:
++        return link
++    if len(recordings) == 1:
++        log.info("using the room's only recording: %s", recordings[0].name)
++        return recordings[0].link(link.origin)
++    print(f"\nthat link is a meeting room with {len(recordings)} recordings:\n")
++    for i, rec in enumerate(recordings, 1):
++        print(f"  [{i}] {rec}")
++    while True:
++        answer = input("\nwhich one? (number, or 'q') ").strip()
++        if answer.lower() in ("q", "quit", ""):
++            raise SystemExit(0)
++        if answer.isdigit() and 1 <= int(answer) <= len(recordings):
++            return recordings[int(answer) - 1].link(link.origin)
++        print("not a valid choice")
++
++
++def _apply_offsets(archive: RecordingArchive, overrides: list[str]) -> None:
++    for item in overrides:
++        if "=" not in item:
++            raise ValueError(f"--offset expects NAME=MS, got {item!r}")
++        name, _, value = item.partition("=")
++        try:
++            offset = int(value)
++        except ValueError:
++            raise ValueError(f"--offset {name}: {value!r} is not a whole number of milliseconds")
++        matched = [s for s in archive.streams if name.lower() in s.name.lower()]
++        if not matched:
++            raise ValueError(f"--offset {name}: no stream matches that name")
++        for stream in matched:
++            stream.offset_ms = offset
++            stream.offset_source = "manual"
++            log.info("%s moved to %.1fs", stream.name, offset / 1000)
++
++
++def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
++    _apply_offsets(archive, args.offset)
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    print()
++    print(archive.summary())
++    print()
++
++    stem = _safe_name(archive.title) or "lecture"
++    notes = _notes(archive)
++    audio_path = video_path = None
++
++    if not args.dry_run:
++        try:
++            ensure_ffmpeg()
++        except FFmpegMissing as exc:
++            print(f"\n{exc}\n")
++            print(f"The raw streams are in {archive.root} - install ffmpeg and run:")
++            print(f"  connect-dl rebuild {archive.root}")
++            return 1
++
++    # Audio first: it is the deliverable that must not fail, and it is quick.
++    if not args.no_audio and archive.audio_streams:
++        audio_path = out_dir / f"{stem}.{args.audio_format}"
++        render_audio(archive, audio_path, fmt=args.audio_format, dry_run=args.dry_run)
++        print(f"  audio  -> {audio_path}")
++
++        if args.speed:
++            fast = out_dir / f"{stem}-{args.speed:g}x.{args.audio_format}"
++            make_speed_variant(audio_path, fast, args.speed, dry_run=args.dry_run)
++            print(f"  audio  -> {fast}  ({args.speed:g}x)")
++    elif not archive.audio_streams:
++        print("  !! no audio stream in this recording - skipping the audio mixdown")
++
++    if not args.audio_only and archive.video_streams:
++        video_path = out_dir / f"{stem}.mp4"
++        try:
++            render_video(
++                archive, video_path,
++                width=args.width, height=args.height, fps=args.fps,
++                camera_pip=not args.no_camera, dry_run=args.dry_run,
++            )
++            print(f"  video  -> {video_path}")
++        except RuntimeError as exc:
++            # Video reconstruction is the fragile half; never let it take the
++            # audio down with it.
++            log.error("video rendering failed: %s", exc)
++            notes.append("Video rendering failed; the audio track is unaffected.")
++            video_path = None
++
++    if not args.no_player and not args.dry_run and (audio_path or video_path):
++        events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
++        page = write_player(
++            out_dir / "play.html",
++            title=archive.title or stem,
++            sources=PlayerSources(
++                video=video_path.name if video_path else None,
++                audio=audio_path.name if audio_path else None,
++            ),
++            events=events,
++            duration_s=archive.duration_ms / 1000.0,
++            notes=notes,
++        )
++        print(f"  player -> {page}")
++
++    print("\ndone.")
++    if notes:
++        print("\nnotes:")
++        for note in notes:
++            print(f"  - {note}")
++    return 0
++
++
++def _notes(archive: RecordingArchive) -> list[str]:
++    notes: list[str] = []
++    guessed = [s for s in archive.streams
++               if s.offset_source in ("sequential", "assumed-zero") and s.duration_ms > 0]
++    if guessed:
++        names = ", ".join(s.name for s in guessed[:4])
++        notes.append(
++            f"Start times for {names} were guessed rather than read from the "
++            f"recording; if those parts drift out of sync, correct them with "
++            f"--offset NAME=MILLISECONDS and run 'connect-dl rebuild'."
++        )
++    legacy = {s.info.audio_codec for s in archive.streams
++              if s.info and s.info.audio_codec in LEGACY_AUDIO}
++    legacy |= {s.info.video_codec for s in archive.streams
++               if s.info and s.info.video_codec in LEGACY_VIDEO}
++    if legacy:
++        notes.append(
++            "This is a Flash-era recording (" + ", ".join(sorted(legacy)) +
++            "). Those codecs were re-encoded so ordinary players can read them."
++        )
++    if not archive.by_role(Role.SCREENSHARE) and archive.by_role(Role.MAIN):
++        notes.append(
++            "No separate screen-share stream was present, so the server's own "
++            "composite (mainstream) was used for the picture."
++        )
++    return notes
++
++
++def _safe_name(title: str | None) -> str | None:
++    if not title:
++        return None
++    cleaned = re.sub(r"[^\w؀-ۿ .-]+", "", title, flags=re.UNICODE).strip()
++    cleaned = re.sub(r"\s+", "-", cleaned)
++    return cleaned[:80] or None
+diff --git a/tools/connect-dl/connect_dl/fetch.py b/tools/connect-dl/connect_dl/fetch.py
+new file mode 100644
+index 0000000..aa0af91
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/fetch.py
+@@ -0,0 +1,186 @@
++"""Downloading the recording payload itself.
++
++Adobe Connect exposes an archive of a recording's source files at::
++
++    <recording-url>/output/<anything>.zip?download=zip
++
++The server builds that zip on demand.  The first request often returns an HTML
++"please wait" page or a zero-length body while the job runs, so the download is
++a poll loop rather than a single GET.
++
++Newer (HTML-client) recordings may instead expose a finished MP4 through the
++same output directory.  We take that when it is offered, since it needs no
++reconstruction at all.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import shutil
++import time
++import urllib.error
++from dataclasses import dataclass
++from pathlib import Path
++
++from .api import ConnectClient, ConnectError
++from .urls import ConnectLink
++
++log = logging.getLogger(__name__)
++
++__all__ = ["download_recording", "DownloadResult"]
++
++# Candidate asset paths, best first.  ``filename`` is arbitrary - the server
++# keys off the ?download=zip parameter, not the name - but some proxies care
++# that the extension matches, so we keep it honest.
++_ZIP_CANDIDATES = (
++    "output/recording.zip?download=zip",
++    "output/filename.zip?download=zip",
++)
++_MP4_CANDIDATES = (
++    "output/recording.mp4?download=mp4",
++    "output/filename.mp4?download=mp4",
++)
++
++_ZIP_MAGIC = b"PK\x03\x04"
++_CHUNK = 1 << 16
++
++
++@dataclass
++class DownloadResult:
++    path: Path
++    kind: str  # "zip" | "mp4"
++    size: int
++
++    @property
++    def is_zip(self) -> bool:
++        return self.kind == "zip"
++
++
++def download_recording(
++    client: ConnectClient,
++    link: ConnectLink,
++    dest_dir: Path,
++    *,
++    poll_timeout: int = 1800,
++    poll_interval: int = 15,
++    prefer: str = "auto",
++) -> DownloadResult:
++    """Fetch a recording's payload into ``dest_dir``.
++
++    ``prefer`` is ``"auto"`` (mp4 if offered, else zip), ``"zip"`` or ``"mp4"``.
++    """
++    dest_dir.mkdir(parents=True, exist_ok=True)
++
++    attempts: list[tuple[str, str]] = []
++    if prefer in ("auto", "mp4"):
++        attempts += [("mp4", c) for c in _MP4_CANDIDATES]
++    if prefer in ("auto", "zip"):
++        attempts += [("zip", c) for c in _ZIP_CANDIDATES]
++
++    deadline = time.monotonic() + poll_timeout
++    last_reason = "no attempt made"
++
++    while time.monotonic() < deadline:
++        for kind, candidate in attempts:
++            url = link.asset(candidate)
++            target = dest_dir / f"recording.{kind}"
++            try:
++                ok, reason = _try_download(client, url, target, kind)
++            except urllib.error.HTTPError as exc:
++                # 404 simply means this server does not offer that form.
++                last_reason = f"HTTP {exc.code} for {candidate}"
++                log.debug("%s -> %s", url, last_reason)
++                continue
++
++            if ok:
++                size = target.stat().st_size
++                log.info("downloaded %s (%s)", target.name, _human(size))
++                return DownloadResult(path=target, kind=kind, size=size)
++
++            last_reason = reason
++            log.debug("%s -> %s", url, reason)
++
++        remaining = int(deadline - time.monotonic())
++        if remaining <= 0:
++            break
++        log.info(
++            "server is still preparing the recording (%s); waiting %ss, %ss left",
++            last_reason, poll_interval, remaining,
++        )
++        time.sleep(min(poll_interval, max(remaining, 1)))
++
++    raise ConnectError(
++        f"could not obtain a downloadable recording from {link.base} ({last_reason}). "
++        "If the recording plays in a browser but will not download, the account "
++        "may lack permission to fetch source files, or the link may point at a "
++        "meeting room rather than an archive."
++    )
++
++
++def _try_download(
++    client: ConnectClient, url: str, target: Path, kind: str
++) -> tuple[bool, str]:
++    """Stream one candidate URL.  Returns ``(succeeded, reason_if_not)``."""
++    with client._open(url) as response:  # noqa: SLF001 - same package
++        content_type = (response.headers.get("Content-Type") or "").lower()
++        declared = response.headers.get("Content-Length")
++        total = int(declared) if declared and declared.isdigit() else None
++
++        head = response.read(len(_ZIP_MAGIC))
++
++        if kind == "zip":
++            if head != _ZIP_MAGIC:
++                # Almost always an HTML holding page while the zip is built.
++                rest = response.read(400)
++                snippet = (head + rest).decode("utf-8", "replace").strip()[:120]
++                return False, f"not a zip yet (content-type {content_type!r}: {snippet!r})"
++        else:
++            if "html" in content_type or head.startswith(b"<"):
++                return False, f"not an mp4 (content-type {content_type!r})"
++
++        tmp = target.with_suffix(target.suffix + ".part")
++        written = len(head)
++        with open(tmp, "wb") as handle:
++            handle.write(head)
++            last_report = time.monotonic()
++            while True:
++                chunk = response.read(_CHUNK)
++                if not chunk:
++                    break
++                handle.write(chunk)
++                written += len(chunk)
++                now = time.monotonic()
++                if now - last_report > 2:
++                    _progress(written, total)
++                    last_report = now
++        _progress(written, total, final=True)
++
++    if written == 0:
++        tmp.unlink(missing_ok=True)
++        return False, "server returned an empty body"
++
++    shutil.move(str(tmp), str(target))
++    return True, ""
++
++
++def _progress(written: int, total: int | None, *, final: bool = False) -> None:
++    if total:
++        pct = 100.0 * written / total
++        line = f"  {_human(written)} / {_human(total)}  ({pct:5.1f}%)"
++    else:
++        line = f"  {_human(written)} downloaded"
++    end = "\n" if final else "\r"
++    print(line.ljust(60), end=end, flush=True)
++
++
++def _human(n: float) -> str:
++    for unit in ("B", "KiB", "MiB", "GiB"):
++        if abs(n) < 1024 or unit == "GiB":
++            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
++        n /= 1024
++    return f"{n:.1f} GiB"
++
++
++def free_space(path: Path) -> int:
++    return shutil.disk_usage(path).free if path.exists() else os.statvfs(".").f_bavail
+diff --git a/tools/connect-dl/connect_dl/flv.py b/tools/connect-dl/connect_dl/flv.py
+new file mode 100644
+index 0000000..2b42aa4
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/flv.py
+@@ -0,0 +1,251 @@
++"""A read-only FLV inspector.
++
++Adobe Connect recordings are delivered as a pile of FLV files with no manifest
++that a normal media tool understands.  Before anything can be re-assembled we
++need, per file: which codecs are inside, whether there is audio at all, and the
++span of timestamps it covers.  ffprobe can answer some of that, but Connect's
++FLVs routinely have a broken or absent duration in their metadata, and we want
++the tool to work even before ffmpeg is installed - so this parses the container
++directly.
++
++The scan only reads tag headers and seeks past payloads, so it costs a few
++hundred seeks even on a multi-gigabyte file.
++
++Format reference: FLV is an 9-byte header, then a chain of
++``(4-byte previous tag size, 11-byte tag header, payload)``.
++"""
++
++from __future__ import annotations
++
++import logging
++import struct
++from dataclasses import dataclass, field
++from pathlib import Path
++
++log = logging.getLogger(__name__)
++
++__all__ = ["FlvInfo", "scan_flv", "AUDIO_CODECS", "VIDEO_CODECS"]
++
++TAG_AUDIO = 8
++TAG_VIDEO = 9
++TAG_SCRIPT = 18
++
++AUDIO_CODECS = {
++    0: "pcm", 1: "adpcm", 2: "mp3", 3: "pcm_le",
++    4: "nellymoser_16k", 5: "nellymoser_8k", 6: "nellymoser",
++    7: "alaw", 8: "mulaw", 10: "aac", 11: "speex",
++    14: "mp3_8k", 15: "device",
++}
++
++VIDEO_CODECS = {
++    2: "h263", 3: "flashsv", 4: "vp6", 5: "vp6a", 6: "flashsv2", 7: "h264",
++}
++
++# Codecs no browser will play; anything using them has to be transcoded before
++# it can go into the HTML player.
++LEGACY_AUDIO = {"nellymoser", "nellymoser_8k", "nellymoser_16k", "speex", "adpcm", "alaw", "mulaw"}
++LEGACY_VIDEO = {"h263", "flashsv", "flashsv2", "vp6", "vp6a"}
++
++
++@dataclass
++class FlvInfo:
++    path: Path
++    ok: bool = False
++    error: str | None = None
++
++    has_audio: bool = False
++    has_video: bool = False
++    audio_codec: str | None = None
++    video_codec: str | None = None
++
++    first_ts: int = 0          # milliseconds, first tag of any kind
++    first_media_ts: int = 0    # milliseconds, first audio/video tag
++    last_ts: int = 0           # milliseconds
++    audio_tags: int = 0
++    video_tags: int = 0
++
++    width: int | None = None
++    height: int | None = None
++    metadata: dict = field(default_factory=dict)
++
++    @property
++    def duration_ms(self) -> int:
++        """Span covered by real media tags."""
++        declared = self.metadata.get("duration")
++        if isinstance(declared, (int, float)) and declared > 0:
++            return int(declared * 1000)
++        return max(0, self.last_ts - self.first_media_ts)
++
++    @property
++    def duration_s(self) -> float:
++        return self.duration_ms / 1000.0
++
++    @property
++    def needs_transcode(self) -> bool:
++        return (self.audio_codec in LEGACY_AUDIO) or (self.video_codec in LEGACY_VIDEO)
++
++    def describe(self) -> str:
++        parts = []
++        if self.has_video:
++            size = f" {self.width}x{self.height}" if self.width else ""
++            parts.append(f"video={self.video_codec}{size}")
++        if self.has_audio:
++            parts.append(f"audio={self.audio_codec}")
++        if not parts:
++            parts.append("no media tags")
++        return f"{', '.join(parts)}, {self.duration_s:.1f}s"
++
++
++def scan_flv(path: Path, *, max_tags: int | None = None) -> FlvInfo:
++    """Inspect an FLV file.  Never raises for malformed input."""
++    info = FlvInfo(path=path)
++    try:
++        size = path.stat().st_size
++    except OSError as exc:
++        info.error = str(exc)
++        return info
++
++    try:
++        with open(path, "rb") as fh:
++            header = fh.read(9)
++            if len(header) < 9 or header[:3] != b"FLV":
++                info.error = "not an FLV file"
++                return info
++
++            header_size = struct.unpack(">I", header[5:9])[0]
++            fh.seek(max(header_size, 9))
++            fh.read(4)  # PreviousTagSize0
++
++            first_seen = False
++            count = 0
++            while True:
++                tag_header = fh.read(11)
++                if len(tag_header) < 11:
++                    break
++
++                tag_type = tag_header[0] & 0x1F
++                data_size = int.from_bytes(tag_header[1:4], "big")
++                ts = int.from_bytes(tag_header[4:7], "big") | (tag_header[7] << 24)
++
++                if data_size < 0 or fh.tell() + data_size > size:
++                    break
++
++                if not first_seen:
++                    info.first_ts = ts
++                    first_seen = True
++
++                if tag_type == TAG_SCRIPT:
++                    payload = fh.read(data_size)
++                    meta = _parse_script_tag(payload)
++                    if meta:
++                        info.metadata.update(meta)
++                elif tag_type == TAG_AUDIO and data_size >= 1:
++                    first_byte = fh.read(1)[0]
++                    fh.seek(data_size - 1, 1)
++                    if not info.has_audio:
++                        info.has_audio = True
++                        info.audio_codec = AUDIO_CODECS.get(first_byte >> 4, f"unknown({first_byte >> 4})")
++                        info.first_media_ts = _min_media(info, ts)
++                    info.audio_tags += 1
++                    info.last_ts = max(info.last_ts, ts)
++                elif tag_type == TAG_VIDEO and data_size >= 1:
++                    first_byte = fh.read(1)[0]
++                    fh.seek(data_size - 1, 1)
++                    if not info.has_video:
++                        info.has_video = True
++                        info.video_codec = VIDEO_CODECS.get(first_byte & 0x0F, f"unknown({first_byte & 0x0F})")
++                        info.first_media_ts = _min_media(info, ts)
++                    info.video_tags += 1
++                    info.last_ts = max(info.last_ts, ts)
++                else:
++                    fh.seek(data_size, 1)
++
++                fh.read(4)  # PreviousTagSize
++                count += 1
++                if max_tags and count >= max_tags:
++                    break
++
++        info.width = _as_int(info.metadata.get("width"))
++        info.height = _as_int(info.metadata.get("height"))
++        info.ok = info.has_audio or info.has_video
++        if not info.ok and not info.error:
++            info.error = "container parsed but contains no audio or video tags"
++    except (OSError, struct.error) as exc:  # pragma: no cover - defensive
++        info.error = f"{type(exc).__name__}: {exc}"
++
++    return info
++
++
++def _min_media(info: FlvInfo, ts: int) -> int:
++    if info.audio_tags == 0 and info.video_tags == 0:
++        return ts
++    return min(info.first_media_ts, ts)
++
++
++def _as_int(value) -> int | None:
++    if isinstance(value, (int, float)) and value > 0:
++        return int(value)
++    return None
++
++
++# ------------------------------------------------------------------ AMF0
++
++def _parse_script_tag(payload: bytes) -> dict:
++    """Pull the property map out of an ``onMetaData`` script tag."""
++    try:
++        name, offset = _amf0_value(payload, 0)
++        if name != "onMetaData":
++            return {}
++        value, _ = _amf0_value(payload, offset)
++        return value if isinstance(value, dict) else {}
++    except (ValueError, struct.error, UnicodeDecodeError, IndexError):
++        return {}
++
++
++def _amf0_value(buf: bytes, i: int):
++    marker = buf[i]
++    i += 1
++    if marker == 0x00:  # number
++        return struct.unpack_from(">d", buf, i)[0], i + 8
++    if marker == 0x01:  # boolean
++        return bool(buf[i]), i + 1
++    if marker == 0x02:  # short string
++        return _amf0_string(buf, i)
++    if marker == 0x03:  # object
++        return _amf0_props(buf, i)
++    if marker in (0x05, 0x06):  # null / undefined
++        return None, i
++    if marker == 0x08:  # ECMA array
++        return _amf0_props(buf, i + 4)
++    if marker == 0x0A:  # strict array
++        count = struct.unpack_from(">I", buf, i)[0]
++        i += 4
++        items = []
++        for _ in range(count):
++            item, i = _amf0_value(buf, i)
++            items.append(item)
++        return items, i
++    if marker == 0x0B:  # date
++        return struct.unpack_from(">d", buf, i)[0], i + 10
++    if marker == 0x0C:  # long string
++        length = struct.unpack_from(">I", buf, i)[0]
++        i += 4
++        return buf[i : i + length].decode("utf-8", "replace"), i + length
++    raise ValueError(f"unsupported AMF0 marker 0x{marker:02x}")
++
++
++def _amf0_string(buf: bytes, i: int):
++    length = struct.unpack_from(">H", buf, i)[0]
++    i += 2
++    return buf[i : i + length].decode("utf-8", "replace"), i + length
++
++
++def _amf0_props(buf: bytes, i: int):
++    out: dict = {}
++    while i < len(buf):
++        key, i = _amf0_string(buf, i)
++        if not key and i < len(buf) and buf[i] == 0x09:
++            return out, i + 1
++        value, i = _amf0_value(buf, i)
++        out[key] = value
++    return out, i
+diff --git a/tools/connect-dl/connect_dl/index.py b/tools/connect-dl/connect_dl/index.py
+new file mode 100644
+index 0000000..4b93af9
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/index.py
+@@ -0,0 +1,172 @@
++"""Recovering the meeting's event track from the recording's XML sidecars.
++
++Connect stores the seek index, pod layout changes and the chat transcript as
++XML alongside the media.  The schemas vary between Connect versions and are not
++documented, so everything here is deliberately tolerant: we look for elements
++that carry a time-like attribute together with something that reads as a label
++or a message, and ignore whatever we do not recognise.
++
++None of this is required for playback - it only enriches the offline player
++with chapter markers and a chat transcript, and is skipped silently when the
++recording has no usable XML.
++"""
++
++from __future__ import annotations
++
++import html
++import logging
++import re
++import xml.etree.ElementTree as ET
++from dataclasses import dataclass
++from pathlib import Path
++
++log = logging.getLogger(__name__)
++
++__all__ = ["Marker", "ChatLine", "parse_events", "Events"]
++
++_TIME_KEYS = ("time", "ts", "timestamp", "start", "starttime", "start-time", "offset", "at")
++_NAME_KEYS = ("name", "label", "title", "text", "value", "description", "caption")
++_SENDER_KEYS = ("from", "sender", "user", "username", "author", "displayname", "name")
++_BODY_KEYS = ("message", "text", "body", "value", "content")
++
++
++@dataclass
++class Marker:
++    time_ms: int
++    label: str
++
++    @property
++    def time_s(self) -> float:
++        return self.time_ms / 1000.0
++
++
++@dataclass
++class ChatLine:
++    time_ms: int
++    sender: str
++    message: str
++
++    @property
++    def time_s(self) -> float:
++        return self.time_ms / 1000.0
++
++
++@dataclass
++class Events:
++    markers: list[Marker]
++    chat: list[ChatLine]
++
++    def __bool__(self) -> bool:
++        return bool(self.markers or self.chat)
++
++
++def parse_events(xml_files: list[Path], *, shift_ms: int = 0, duration_ms: int = 0) -> Events:
++    """Extract chapter markers and chat lines from a recording's XML files.
++
++    ``shift_ms`` is subtracted from every timestamp so events line up with the
++    normalised media timeline; entries falling outside the recording are dropped.
++    """
++    markers: list[Marker] = []
++    chat: list[ChatLine] = []
++
++    for path in xml_files:
++        try:
++            tree = ET.parse(path)
++        except (ET.ParseError, OSError) as exc:
++            log.debug("skipping %s: %s", path.name, exc)
++            continue
++
++        is_chat = "chat" in path.name.lower()
++        for element in tree.iter():
++            time_ms = _time_of(element)
++            if time_ms is None:
++                continue
++            if is_chat:
++                line = _as_chat(element, time_ms)
++                if line:
++                    chat.append(line)
++            else:
++                marker = _as_marker(element, time_ms)
++                if marker:
++                    markers.append(marker)
++
++    markers = _tidy(markers, shift_ms, duration_ms, key=lambda m: (m.time_ms, m.label))
++    chat = _tidy(chat, shift_ms, duration_ms, key=lambda c: (c.time_ms, c.sender, c.message))
++
++    if markers or chat:
++        log.info("recovered %d chapter marker(s) and %d chat line(s)", len(markers), len(chat))
++    return Events(markers=markers, chat=chat)
++
++
++def _tidy(items, shift_ms, duration_ms, key):
++    out = []
++    seen = set()
++    for item in items:
++        item.time_ms -= shift_ms
++        if item.time_ms < 0:
++            continue
++        if duration_ms and item.time_ms > duration_ms + 5000:
++            continue
++        signature = key(item)
++        if signature in seen:
++            continue
++        seen.add(signature)
++        out.append(item)
++    out.sort(key=lambda i: i.time_ms)
++    return out
++
++
++def _time_of(element: ET.Element) -> int | None:
++    for key, value in element.attrib.items():
++        if key.lower().replace("_", "-") not in _TIME_KEYS:
++            continue
++        try:
++            number = float(value)
++        except (TypeError, ValueError):
++            continue
++        if number >= 0:
++            return int(number)
++    return None
++
++
++def _pick(element: ET.Element, keys: tuple[str, ...]) -> str | None:
++    for key in keys:
++        for attr, value in element.attrib.items():
++            if attr.lower().replace("_", "-") == key and value and value.strip():
++                return _clean(value)
++    for key in keys:
++        child = element.find(key)
++        if child is not None and child.text and child.text.strip():
++            return _clean(child.text)
++    return None
++
++
++def _clean(text: str) -> str:
++    text = html.unescape(text)
++    text = re.sub(r"<[^>]+>", "", text)          # Connect wraps chat in markup
++    return re.sub(r"\s+", " ", text).strip()
++
++
++def _as_marker(element: ET.Element, time_ms: int) -> Marker | None:
++    label = _pick(element, _NAME_KEYS)
++    if not label:
++        text = (element.text or "").strip()
++        label = _clean(text) if text else None
++    if not label or len(label) > 160:
++        return None
++    if label.replace(".", "").isdigit():
++        return None
++    return Marker(time_ms=time_ms, label=label)
++
++
++def _as_chat(element: ET.Element, time_ms: int) -> ChatLine | None:
++    message = _pick(element, _BODY_KEYS)
++    if not message:
++        text = (element.text or "").strip()
++        message = _clean(text) if text else None
++    if not message:
++        return None
++    sender = _pick(element, _SENDER_KEYS) or ""
++    if sender == message:
++        sender = ""
++    return ChatLine(time_ms=time_ms, sender=sender, message=message)
+diff --git a/tools/connect-dl/connect_dl/media.py b/tools/connect-dl/connect_dl/media.py
+new file mode 100644
+index 0000000..f6e1242
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/media.py
+@@ -0,0 +1,372 @@
++"""Turning the loose FLV streams into files a normal player can open.
++
++Two products come out of here:
++
++* **the lecture audio** - every microphone segment placed at its true position
++  on the meeting timeline and mixed down to one continuous track.  This is the
++  deliverable that matters most: it survives even when the video streams are
++  unreadable, and it is what gets played back at 2x.
++* **the lecture video** - the shared screen laid onto a fixed canvas at the
++  right moments, with the webcam as picture-in-picture and the mixed audio
++  attached.
++
++Both are built by generating an ffmpeg filtergraph rather than by shelling out
++repeatedly, so a two-hour recording is one pass rather than dozens.
++
++Nothing here assumes a modern ffmpeg beyond the filters named; where a filter
++option is recent (``amix``'s ``normalize``) the call is retried without it.
++"""
++
++from __future__ import annotations
++
++import logging
++import shutil
++import subprocess
++from dataclasses import dataclass
++from pathlib import Path
++
++from .archive import RecordingArchive, Stream
++
++log = logging.getLogger(__name__)
++
++__all__ = [
++    "FFmpegMissing", "ensure_ffmpeg", "render_audio", "render_video",
++    "make_speed_variant", "atempo_chain", "transcode_for_web",
++]
++
++AUDIO_ENCODERS = {
++    "mp3": ["-c:a", "libmp3lame", "-q:a", "4"],
++    "m4a": ["-c:a", "aac", "-b:a", "96k"],
++    "opus": ["-c:a", "libopus", "-b:a", "48k"],
++    "wav": ["-c:a", "pcm_s16le"],
++}
++
++
++class FFmpegMissing(RuntimeError):
++    pass
++
++
++@dataclass
++class Tool:
++    ffmpeg: str
++    ffprobe: str | None
++
++
++def ensure_ffmpeg(*, dry_run: bool = False) -> Tool:
++    """Locate ffmpeg.  Under ``dry_run`` we only need a name to print."""
++    if dry_run:
++        return Tool(ffmpeg="ffmpeg", ffprobe=None)
++    ffmpeg = shutil.which("ffmpeg")
++    if not ffmpeg:
++        raise FFmpegMissing(
++            "ffmpeg was not found on PATH.\n"
++            "  Debian/Ubuntu : sudo apt install ffmpeg\n"
++            "  Fedora        : sudo dnf install ffmpeg\n"
++            "  Arch          : sudo pacman -S ffmpeg\n"
++            "ffmpeg is what decodes Connect's Nellymoser/Speex audio and Flash "
++            "Screen Video, so it is required for anything beyond downloading."
++        )
++    return Tool(ffmpeg=ffmpeg, ffprobe=shutil.which("ffprobe"))
++
++
++def run(cmd: list[str], *, dry_run: bool = False, retry_without: str | None = None) -> None:
++    """Run ffmpeg, optionally retrying with one filter option stripped."""
++    printable = " ".join(_quote(c) for c in cmd)
++    if dry_run:
++        print(printable)
++        return
++    log.debug("running: %s", printable)
++    result = subprocess.run(cmd, capture_output=True, text=True)
++    if result.returncode == 0:
++        return
++
++    if retry_without and retry_without in printable:
++        log.warning("ffmpeg rejected %r, retrying without it", retry_without)
++        stripped = [c.replace(retry_without, "") for c in cmd]
++        result = subprocess.run(stripped, capture_output=True, text=True)
++        if result.returncode == 0:
++            return
++
++    tail = "\n".join(result.stderr.strip().splitlines()[-25:])
++    raise RuntimeError(f"ffmpeg failed (exit {result.returncode})\ncommand: {printable}\n{tail}")
++
++
++def _quote(token: str) -> str:
++    return f"'{token}'" if any(ch in token for ch in " ;[]|'\"") else token
++
++
++# ------------------------------------------------------------------- audio
++
++def build_audio_filter(streams: list[Stream]) -> tuple[str, str]:
++    """Filtergraph placing each audio stream at its offset and mixing them.
++
++    Returns ``(filtergraph, output_label)``.
++    """
++    if not streams:
++        raise ValueError("no audio streams to mix")
++
++    parts: list[str] = []
++    labels: list[str] = []
++    for index, stream in enumerate(streams):
++        label = f"a{index}"
++        chain = [
++            # Connect's VoIP audio is mono at odd sample rates; normalise first
++            # so the mixer is not resampling several different formats at once.
++            "aresample=async=1:first_pts=0",
++            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
++        ]
++        if stream.offset_ms > 0:
++            chain.append(f"adelay={stream.offset_ms}:all=1")
++        parts.append(f"[{index}:a]{','.join(chain)}[{label}]")
++        labels.append(f"[{label}]")
++
++    if len(labels) == 1:
++        # A single source still needs a named output for -map to reference.
++        parts.append(f"{labels[0]}anull[aout]")
++    else:
++        parts.append(
++            f"{''.join(labels)}amix=inputs={len(labels)}"
++            f":duration=longest:dropout_transition=0:normalize=0[aout]"
++        )
++    return ";".join(parts), "[aout]"
++
++
++def render_audio(
++    archive: RecordingArchive,
++    out_path: Path,
++    *,
++    fmt: str = "mp3",
++    tool: Tool | None = None,
++    dry_run: bool = False,
++) -> Path:
++    """Mix every voice stream into one timeline-correct lecture track."""
++    tool = tool or ensure_ffmpeg(dry_run=dry_run)
++    streams = archive.audio_streams
++    if not streams:
++        raise RuntimeError(
++            "this recording contains no audio-bearing stream. "
++            "If the class used a telephone bridge, the audio may not be in the "
++            "archive at all and has to be requested from the Connect administrator."
++        )
++
++    graph, out_label = build_audio_filter(streams)
++    cmd = [tool.ffmpeg, "-y", "-nostdin"]
++    for stream in streams:
++        cmd += ["-i", str(stream.path)]
++    cmd += ["-filter_complex", graph, "-map", out_label, "-vn"]
++    cmd += AUDIO_ENCODERS.get(fmt, AUDIO_ENCODERS["mp3"])
++    if archive.title:
++        cmd += ["-metadata", f"title={archive.title}"]
++    cmd += [str(out_path)]
++
++    log.info("mixing %d audio segment(s) into %s", len(streams), out_path.name)
++    run(cmd, dry_run=dry_run, retry_without=":normalize=0")
++    return out_path
++
++
++# ------------------------------------------------------------------- video
++
++def build_video_filter(
++    screens: list[Stream],
++    cameras: list[Stream],
++    audio: list[Stream],
++    *,
++    width: int,
++    height: int,
++    fps: int,
++    duration_s: float,
++    pip_width: int = 240,
++) -> tuple[str, list[str], str, str | None]:
++    """Compose the shared screen (and webcam PiP) onto a fixed canvas.
++
++    Returns ``(filtergraph, input_paths, video_label, audio_label)``.  Input 0
++    is reserved for a black ``color`` source supplied by the caller: it defines
++    the canvas and the full duration, so stretches where nothing was shared stay
++    black instead of freezing on a stale frame.  ``input_paths`` are the real
++    files, starting at slot 1.
++
++    A file used for both its picture and its sound (``cameraVoip`` carries both)
++    is opened once and referenced twice, so ffmpeg decodes it a single time.
++    """
++    inputs: list[str] = []
++    slots: dict[str, int] = {}
++    parts: list[str] = []
++
++    def slot_for(stream: Stream) -> int:
++        """Input index for a file, reusing one already opened."""
++        key = str(stream.path)
++        if key not in slots:
++            inputs.append(key)
++            slots[key] = len(inputs)  # slot 0 is the colour source
++        return slots[key]
++
++    current = "[0:v]"
++
++    def overlay(stream: Stream, target_w: int, position: str) -> None:
++        nonlocal current
++        index = slot_for(stream)
++        label = f"v{index}"
++        chain = [
++            f"scale={target_w}:-2:force_original_aspect_ratio=decrease",
++            f"fps={fps}",
++            "setpts=PTS-STARTPTS",
++        ]
++        if stream.offset_ms > 0:
++            # tpad prepends blank frames so the segment lands at its real time.
++            chain.append(
++                f"tpad=start_duration={stream.offset_ms / 1000:.3f}:start_mode=add:color=black"
++            )
++        parts.append(f"[{index}:v]{','.join(chain)}[{label}]")
++        nxt = f"[c{index}]"
++        parts.append(
++            f"{current}[{label}]overlay={position}:eof_action=pass:repeatlast=0{nxt}"
++        )
++        current = nxt
++
++    for stream in screens:
++        overlay(stream, width, "(W-w)/2:(H-h)/2")
++    for stream in cameras:
++        overlay(stream, pip_width, "W-w-16:H-h-16")
++
++    parts.append(f"{current}format=yuv420p[vout]")
++
++    audio_label = None
++    if audio:
++        labels = []
++        for stream in audio:
++            index = slot_for(stream)
++            label = f"pa{index}"
++            chain = [
++                "aresample=async=1:first_pts=0",
++                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
++            ]
++            if stream.offset_ms > 0:
++                chain.append(f"adelay={stream.offset_ms}:all=1")
++            parts.append(f"[{index}:a]{','.join(chain)}[{label}]")
++            labels.append(f"[{label}]")
++        if len(labels) == 1:
++            parts.append(f"{labels[0]}anull[aout]")
++        else:
++            parts.append(
++                f"{''.join(labels)}amix=inputs={len(labels)}"
++                f":duration=longest:dropout_transition=0:normalize=0[aout]"
++            )
++        audio_label = "[aout]"
++
++    return ";".join(parts), inputs, "[vout]", audio_label
++
++
++def render_video(
++    archive: RecordingArchive,
++    out_path: Path,
++    *,
++    width: int = 1280,
++    height: int = 720,
++    fps: int = 5,
++    crf: int = 28,
++    preset: str = "veryfast",
++    camera_pip: bool = True,
++    tool: Tool | None = None,
++    dry_run: bool = False,
++) -> Path:
++    """Render the reconstructed lecture video."""
++    tool = tool or ensure_ffmpeg(dry_run=dry_run)
++    screens = archive.video_streams
++    if not screens:
++        raise RuntimeError("no screen-share or main video stream found in this recording")
++
++    cameras = archive.camera_streams if camera_pip else []
++    # When the camera is the only picture there is, promote it instead of
++    # tucking it into a corner of an otherwise black frame.
++    if cameras and screens and screens[0].role.value == "camera":
++        cameras = []
++
++    audio = archive.audio_streams
++    duration_s = max(archive.duration_ms / 1000.0, 1.0)
++
++    graph, inputs, vlabel, alabel = build_video_filter(
++        screens, cameras, audio,
++        width=width, height=height, fps=fps, duration_s=duration_s,
++    )
++
++    cmd = [tool.ffmpeg, "-y", "-nostdin", "-f", "lavfi", "-i",
++           f"color=c=black:s={width}x{height}:r={fps}:d={duration_s:.3f}"]
++    for path in inputs:
++        cmd += ["-i", path]
++    cmd += ["-filter_complex", graph, "-map", vlabel]
++    if alabel:
++        cmd += ["-map", alabel, "-c:a", "aac", "-b:a", "96k"]
++    cmd += [
++        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
++        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
++        "-t", f"{duration_s:.3f}",
++    ]
++    if archive.title:
++        cmd += ["-metadata", f"title={archive.title}"]
++    cmd += [str(out_path)]
++
++    log.info("rendering video: %d screen + %d camera + %d audio stream(s)",
++             len(screens), len(cameras), len(audio))
++    run(cmd, dry_run=dry_run, retry_without=":normalize=0")
++    return out_path
++
++
++# -------------------------------------------------------------- speed / web
++
++def atempo_chain(speed: float) -> str:
++    """Express an arbitrary speed as a chain of in-range ``atempo`` filters.
++
++    ``atempo`` accepts 0.5-2.0 on older ffmpeg builds, so 3x becomes
++    ``atempo=1.5,atempo=2.0``.
++    """
++    if speed <= 0:
++        raise ValueError("speed must be positive")
++    if abs(speed - 1.0) < 1e-6:
++        return "anull"
++
++    factors: list[float] = []
++    remaining = speed
++    while remaining > 2.0:
++        factors.append(2.0)
++        remaining /= 2.0
++    while remaining < 0.5:
++        factors.append(0.5)
++        remaining /= 0.5
++    factors.append(remaining)
++    return ",".join(f"atempo={f:g}" for f in factors)
++
++
++def make_speed_variant(
++    src: Path, out_path: Path, speed: float, *,
++    tool: Tool | None = None, dry_run: bool = False,
++) -> Path:
++    """Bake a permanently sped-up copy, for players with no speed control."""
++    tool = tool or ensure_ffmpeg(dry_run=dry_run)
++    cmd = [
++        tool.ffmpeg, "-y", "-nostdin", "-i", str(src),
++        "-filter:a", atempo_chain(speed), "-vn",
++    ]
++    cmd += AUDIO_ENCODERS.get(out_path.suffix.lstrip("."), AUDIO_ENCODERS["mp3"])
++    cmd += [str(out_path)]
++    log.info("writing %gx copy to %s", speed, out_path.name)
++    run(cmd, dry_run=dry_run)
++    return out_path
++
++
++def transcode_for_web(
++    stream: Stream, out_path: Path, *,
++    width: int = 1280, fps: int = 5, crf: int = 30,
++    tool: Tool | None = None, dry_run: bool = False,
++) -> Path:
++    """Re-encode one FLV into browser-playable MP4 for the offline player."""
++    tool = tool or ensure_ffmpeg(dry_run=dry_run)
++    cmd = [
++        tool.ffmpeg, "-y", "-nostdin", "-i", str(stream.path),
++        "-vf", f"scale={width}:-2:force_original_aspect_ratio=decrease,fps={fps}",
++        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
++        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
++    ]
++    cmd += ["-c:a", "aac", "-b:a", "96k"] if stream.has_audio else ["-an"]
++    cmd += [str(out_path)]
++    run(cmd, dry_run=dry_run)
++    return out_path
+diff --git a/tools/connect-dl/connect_dl/player.py b/tools/connect-dl/connect_dl/player.py
+new file mode 100644
+index 0000000..85b5427
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/player.py
+@@ -0,0 +1,359 @@
++"""Generation of the offline playback page.
++
++The output is one self-contained HTML file next to the rendered media.  It
++reconstructs the parts of the Connect playback experience that matter for
++reviewing a lecture - the shared screen, the chapter index and the chat
++transcript running alongside - and adds the thing Connect's own player does not
++offer: an arbitrary playback rate.
++
++The page references the media as sibling files rather than embedding it, so a
++two-hour recording does not have to be base64'd into the document.  Everything
++else (styles, script, transcript data) is inlined, so the folder can be copied
++around and it still works with no server and no network.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++
++from .index import Events
++
++__all__ = ["write_player"]
++
++SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4]
++
++
++@dataclass
++class PlayerSources:
++    video: str | None = None
++    audio: str | None = None
++    poster: str | None = None
++
++
++def write_player(
++    out_path: Path,
++    *,
++    title: str,
++    sources: PlayerSources,
++    events: Events,
++    duration_s: float,
++    notes: list[str] | None = None,
++) -> Path:
++    payload = {
++        "title": title,
++        "video": sources.video,
++        "audio": sources.audio,
++        "duration": duration_s,
++        "speeds": SPEEDS,
++        "markers": [{"t": m.time_s, "label": m.label} for m in events.markers],
++        "chat": [{"t": c.time_s, "from": c.sender, "msg": c.message} for c in events.chat],
++        "notes": notes or [],
++        "key": out_path.stem,
++    }
++    html = _TEMPLATE.replace("/*__DATA__*/null", json.dumps(payload, ensure_ascii=False))
++    html = html.replace("__TITLE__", _escape(title))
++    out_path.write_text(html, encoding="utf-8")
++    return out_path
++
++
++def _escape(text: str) -> str:
++    return (
++        text.replace("&", "&amp;").replace("<", "&lt;")
++        .replace(">", "&gt;").replace('"', "&quot;")
++    )
++
++
++_TEMPLATE = r"""<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>__TITLE__</title>
++<style>
++  :root {
++    --bg: #14161a; --panel: #1c1f26; --line: #2c313b;
++    --fg: #e7e9ee; --muted: #99a0ae; --accent: #5b9dff; --accent-fg: #08101f;
++  }
++  * { box-sizing: border-box; }
++  html, body { height: 100%; margin: 0; }
++  body {
++    background: var(--bg); color: var(--fg);
++    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
++    display: flex; flex-direction: column;
++  }
++  header {
++    padding: 10px 16px; border-bottom: 1px solid var(--line);
++    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
++  }
++  header h1 { font-size: 16px; font-weight: 600; margin: 0; }
++  header .meta { color: var(--muted); font-size: 13px; }
++  main { flex: 1; display: flex; min-height: 0; }
++  .stage {
++    flex: 1; min-width: 0; display: flex; flex-direction: column;
++    background: #000; position: relative;
++  }
++  .stage video, .stage audio { width: 100%; flex: 1; min-height: 0; background: #000; display: block; }
++  .stage audio { height: 54px; flex: 0 0 auto; margin: auto; max-width: 640px; }
++  .audio-only { flex: 1; display: grid; place-content: center; gap: 14px; text-align: center; padding: 32px; }
++  .audio-only .big { font-size: 44px; }
++  .audio-only p { color: var(--muted); margin: 0; max-width: 44ch; }
++
++  .transport {
++    background: var(--panel); border-top: 1px solid var(--line);
++    padding: 10px 14px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
++  }
++  .transport button {
++    background: #262b35; color: var(--fg); border: 1px solid var(--line);
++    border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 13px;
++  }
++  .transport button:hover { border-color: var(--accent); }
++  .speeds { display: flex; gap: 4px; flex-wrap: wrap; }
++  .speeds button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
++  .clock { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
++  .rate-badge { font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
++
++  aside {
++    width: 340px; flex: 0 0 340px; border-left: 1px solid var(--line);
++    background: var(--panel); display: flex; flex-direction: column; min-height: 0;
++  }
++  .tabs { display: flex; border-bottom: 1px solid var(--line); }
++  .tabs button {
++    flex: 1; background: none; border: 0; border-bottom: 2px solid transparent;
++    color: var(--muted); padding: 10px; cursor: pointer; font: inherit; font-size: 13px;
++  }
++  .tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
++  .list { overflow-y: auto; flex: 1; padding: 6px; }
++  .row {
++    display: flex; gap: 10px; padding: 7px 8px; border-radius: 6px;
++    cursor: pointer; align-items: baseline;
++  }
++  .row:hover { background: #262b35; }
++  .row.now { background: #22314b; }
++  .row .t { color: var(--accent); font-variant-numeric: tabular-nums; font-size: 12px; flex: 0 0 auto; }
++  .row .who { color: var(--muted); font-size: 12px; }
++  .row .txt { min-width: 0; overflow-wrap: anywhere; }
++  .empty { color: var(--muted); padding: 18px; text-align: center; font-size: 13px; }
++  .notes { padding: 10px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
++  .notes li { margin: 3px 0; }
++  kbd {
++    background: #262b35; border: 1px solid var(--line); border-bottom-width: 2px;
++    border-radius: 4px; padding: 0 5px; font-size: 11px; font-family: inherit;
++  }
++  @media (max-width: 820px) {
++    main { flex-direction: column; }
++    aside { width: auto; flex: 0 0 45%; border-left: 0; border-top: 1px solid var(--line); }
++  }
++</style>
++</head>
++<body>
++<header>
++  <h1 id="title"></h1>
++  <span class="meta" id="meta"></span>
++</header>
++
++<main>
++  <div class="stage">
++    <div id="media"></div>
++    <div class="transport">
++      <button id="play">Play</button>
++      <button data-seek="-30">&#171; 30s</button>
++      <button data-seek="-10">&#171; 10s</button>
++      <button data-seek="10">10s &#187;</button>
++      <button data-seek="30">30s &#187;</button>
++      <span class="clock" id="clock">0:00 / 0:00</span>
++      <span class="speeds" id="speeds"></span>
++      <span class="rate-badge" id="rate">1x</span>
++    </div>
++  </div>
++
++  <aside>
++    <div class="tabs">
++      <button data-tab="chapters" class="on">Chapters</button>
++      <button data-tab="chat">Chat</button>
++    </div>
++    <div class="list" id="chapters"></div>
++    <div class="list" id="chat" hidden></div>
++    <div class="notes">
++      <div><kbd>space</kbd> play &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> 10s &middot;
++           <kbd>J</kbd><kbd>L</kbd> 30s &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> speed &middot;
++           <kbd>0</kbd> reset speed</div>
++      <ul id="notes"></ul>
++    </div>
++  </aside>
++</main>
++
++<script>
++const DATA = /*__DATA__*/null;
++
++const $ = (id) => document.getElementById(id);
++const fmt = (s) => {
++  if (!isFinite(s) || s < 0) s = 0;
++  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = Math.floor(s % 60);
++  return (h ? h + ":" + String(m).padStart(2, "0") : String(m)) + ":" + String(x).padStart(2, "0");
++};
++
++document.title = DATA.title;
++$("title").textContent = DATA.title;
++
++// ---- media element -------------------------------------------------------
++let media;
++if (DATA.video) {
++  media = document.createElement("video");
++  media.src = DATA.video;
++  media.controls = true;
++  media.preload = "metadata";
++  if (DATA.poster) media.poster = DATA.poster;
++  $("media").replaceWith(media);
++} else {
++  const wrap = document.createElement("div");
++  wrap.className = "audio-only";
++  wrap.innerHTML = '<div class="big">&#127911;</div>' +
++    '<p>This recording was reconstructed as audio only &mdash; the lecturer&rsquo;s voice ' +
++    'on a single continuous timeline.</p>';
++  media = document.createElement("audio");
++  media.src = DATA.audio;
++  media.controls = true;
++  media.preload = "metadata";
++  wrap.appendChild(media);
++  $("media").replaceWith(wrap);
++}
++
++$("meta").textContent = (DATA.markers.length ? DATA.markers.length + " chapters · " : "") +
++                        (DATA.chat.length ? DATA.chat.length + " chat lines · " : "") +
++                        fmt(DATA.duration);
++
++// ---- speed ---------------------------------------------------------------
++// The whole point of the exercise: an arbitrary, persisted playback rate.
++const STORE = "connect-dl:" + DATA.key;
++const saved = JSON.parse(localStorage.getItem(STORE) || "{}");
++let rate = saved.rate || 1;
++
++function applyRate(r) {
++  rate = Math.min(16, Math.max(0.25, Math.round(r * 100) / 100));
++  media.playbackRate = rate;
++  // Keep pitch correction on where the browser exposes it, so a 2x lecture
++  // still sounds like the lecturer rather than a chipmunk.
++  media.preservesPitch = true;
++  media.mozPreservesPitch = true;
++  media.webkitPreservesPitch = true;
++  $("rate").textContent = rate + "x";
++  for (const b of $("speeds").children) b.classList.toggle("on", Number(b.dataset.rate) === rate);
++  persist();
++}
++
++const speedBox = $("speeds");
++for (const s of DATA.speeds) {
++  const b = document.createElement("button");
++  b.textContent = s + "x";
++  b.dataset.rate = s;
++  b.onclick = () => applyRate(s);
++  speedBox.appendChild(b);
++}
++
++// ---- transport -----------------------------------------------------------
++$("play").onclick = () => media.paused ? media.play() : media.pause();
++media.addEventListener("play", () => $("play").textContent = "Pause");
++media.addEventListener("pause", () => $("play").textContent = "Play");
++for (const b of document.querySelectorAll("[data-seek]")) {
++  b.onclick = () => { media.currentTime += Number(b.dataset.seek); };
++}
++
++let persistTimer = null;
++function persist() {
++  clearTimeout(persistTimer);
++  persistTimer = setTimeout(() => {
++    localStorage.setItem(STORE, JSON.stringify({ rate, time: media.currentTime }));
++  }, 400);
++}
++
++media.addEventListener("loadedmetadata", () => {
++  applyRate(rate);
++  if (saved.time && saved.time < (media.duration || DATA.duration) - 5) {
++    media.currentTime = saved.time;
++  }
++});
++
++// ---- sidebar -------------------------------------------------------------
++function fill(container, items, render) {
++  if (!items.length) {
++    container.innerHTML = '<div class="empty">Nothing recovered from this recording.</div>';
++    return [];
++  }
++  const rows = items.map((item) => {
++    const row = document.createElement("div");
++    row.className = "row";
++    row.innerHTML = render(item);
++    row.onclick = () => { media.currentTime = item.t; media.play(); };
++    container.appendChild(row);
++    return row;
++  });
++  return rows;
++}
++
++const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
++  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
++
++const chapterRows = fill($("chapters"), DATA.markers,
++  (m) => '<span class="t">' + fmt(m.t) + '</span><span class="txt">' + esc(m.label) + "</span>");
++const chatRows = fill($("chat"), DATA.chat,
++  (c) => '<span class="t">' + fmt(c.t) + '</span><span class="txt">' +
++         (c.from ? '<span class="who">' + esc(c.from) + "</span> " : "") + esc(c.msg) + "</span>");
++
++for (const b of document.querySelectorAll("[data-tab]")) {
++  b.onclick = () => {
++    for (const o of document.querySelectorAll("[data-tab]")) o.classList.toggle("on", o === b);
++    $("chapters").hidden = b.dataset.tab !== "chapters";
++    $("chat").hidden = b.dataset.tab !== "chat";
++  };
++}
++
++const notes = $("notes");
++for (const n of DATA.notes) {
++  const li = document.createElement("li");
++  li.textContent = n;
++  notes.appendChild(li);
++}
++
++// ---- follow playback -----------------------------------------------------
++function highlight(rows, items) {
++  let active = -1;
++  for (let i = 0; i < items.length; i++) if (items[i].t <= media.currentTime + 0.25) active = i;
++  rows.forEach((row, i) => row.classList.toggle("now", i === active));
++  return active;
++}
++
++let lastChat = -1;
++media.addEventListener("timeupdate", () => {
++  $("clock").textContent = fmt(media.currentTime) + " / " + fmt(media.duration || DATA.duration);
++  highlight(chapterRows, DATA.markers);
++  const i = highlight(chatRows, DATA.chat);
++  if (i !== lastChat && i >= 0 && !$("chat").hidden) {
++    chatRows[i].scrollIntoView({ block: "nearest" });
++    lastChat = i;
++  }
++  persist();
++});
++
++// ---- keyboard ------------------------------------------------------------
++addEventListener("keydown", (e) => {
++  if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
++  const step = 0.25;
++  switch (e.key) {
++    case " ": case "k": media.paused ? media.play() : media.pause(); break;
++    case "ArrowLeft":  media.currentTime -= 10; break;
++    case "ArrowRight": media.currentTime += 10; break;
++    case "j": media.currentTime -= 30; break;
++    case "l": media.currentTime += 30; break;
++    case "ArrowUp":   applyRate(rate + step); break;
++    case "ArrowDown": applyRate(rate - step); break;
++    case "0": applyRate(1); break;
++    default: return;
++  }
++  e.preventDefault();
++});
++</script>
++</body>
++</html>
++"""
+diff --git a/tools/connect-dl/connect_dl/urls.py b/tools/connect-dl/connect_dl/urls.py
+new file mode 100644
+index 0000000..14fba6b
+--- /dev/null
++++ b/tools/connect-dl/connect_dl/urls.py
+@@ -0,0 +1,151 @@
++"""Parsing and normalisation of the many shapes an Adobe Connect link can take.
++
++A user typically has one of these in hand:
++
++  https://vadavc41.ec.iau.ir/p8fj3k2la9x/                  recording short link
++  https://vadavc41.ec.iau.ir/l993retztu2a/                 meeting room link
++  https://acc.example.edu/p8fj3k2la9x/?pbMode=normal       recording, player mode
++  connectpro://vadavc41.ec.iau.ir/l993retztu2a/?session=…  what the desktop client gets
++  https://acc.example.edu/p8fj3k2la9x/output/f.zip?…       an already-built asset link
++
++They all reduce to (origin, url_path, session_token).  ``url_path`` is the SCO
++"url-path" Adobe Connect uses as the public handle for a room or a recording.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from urllib.parse import parse_qs, urlparse, urlunparse
++
++__all__ = ["ConnectLink", "parse_link", "InvalidLink"]
++
++
++class InvalidLink(ValueError):
++    """Raised when a string cannot be read as an Adobe Connect link."""
++
++
++# Path segments that are part of Connect's own plumbing rather than a SCO handle.
++_RESERVED_SEGMENTS = {
++    "api",
++    "admin",
++    "system",
++    "common",
++    "content",
++    "flash",
++    "output",
++    "swf",
++    "app",
++    "connect",
++}
++
++# A SCO url-path is a short alphanumeric token.  Recordings conventionally start
++# with "p", rooms with a letter, but neither is guaranteed across Connect
++# versions, so we match structurally rather than by prefix.
++_URL_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
++
++
++@dataclass(frozen=True)
++class ConnectLink:
++    """A normalised Adobe Connect location."""
++
++    origin: str
++    """Scheme + host + port, e.g. ``https://acc.example.edu``."""
++
++    url_path: str | None
++    """The SCO handle without slashes, e.g. ``p8fj3k2la9x``.  ``None`` when the
++    link only identifies a server (the account root)."""
++
++    session: str | None = None
++    """A BREEZESESSION value lifted from the query string, when present."""
++
++    sco_id: str | None = None
++    """A numeric sco-id, when the link carried one instead of a url-path."""
++
++    @property
++    def base(self) -> str:
++        """The canonical playback URL, with trailing slash."""
++        if not self.url_path:
++            return self.origin + "/"
++        return f"{self.origin}/{self.url_path}/"
++
++    @property
++    def api(self) -> str:
++        return f"{self.origin}/api/xml"
++
++    def asset(self, path: str) -> str:
++        """URL for a file inside this SCO's output directory."""
++        return self.base + path.lstrip("/")
++
++    def __str__(self) -> str:  # pragma: no cover - cosmetic
++        return self.base
++
++
++def _clean_host_scheme(raw: str) -> str:
++    """Map Connect's private schemes onto https."""
++    lowered = raw.strip()
++    for scheme in ("connectpro://", "connect://", "meeting://"):
++        if lowered.lower().startswith(scheme):
++            rest = lowered[len(scheme) :]
++            # connectpro://https://host/... is a real form the launcher produces.
++            if rest.lower().startswith(("http://", "https://")):
++                return rest
++            return "https://" + rest
++    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", lowered):
++        return "https://" + lowered
++    return lowered
++
++
++def parse_link(raw: str) -> ConnectLink:
++    """Turn any user-supplied Connect link into a :class:`ConnectLink`.
++
++    Raises :class:`InvalidLink` if no host can be determined.
++    """
++    if not raw or not raw.strip():
++        raise InvalidLink("empty link")
++
++    parsed = urlparse(_clean_host_scheme(raw))
++    if not parsed.netloc:
++        raise InvalidLink(f"could not find a host in {raw!r}")
++
++    scheme = "https" if parsed.scheme in ("", "http", "connectpro") else parsed.scheme
++    origin = urlunparse((scheme, parsed.netloc, "", "", "", "")).rstrip("/")
++
++    query = parse_qs(parsed.query)
++    session = _first(query, "session", "BREEZESESSION", "breezesession")
++    sco_id = _first(query, "sco-id", "sco_id", "scoId")
++
++    url_path = _extract_url_path(parsed.path)
++
++    return ConnectLink(origin=origin, url_path=url_path, session=session, sco_id=sco_id)
++
++
++def _first(query: dict[str, list[str]], *keys: str) -> str | None:
++    for key in keys:
++        values = query.get(key)
++        if values and values[0].strip():
++            return values[0].strip()
++    return None
++
++
++def _extract_url_path(path: str) -> str | None:
++    """Pick the SCO handle out of a URL path.
++
++    The handle is the first segment that looks like a token and is not one of
++    Connect's reserved paths.  Anything after it (``output/…``, ``index.html``)
++    is ignored.
++    """
++    for segment in path.split("/"):
++        segment = segment.strip()
++        if not segment:
++            continue
++        if segment.lower() in _RESERVED_SEGMENTS:
++            # Reserved segments never precede the handle in practice; stop so we
++            # do not mistake "xml" in /api/xml for a SCO.
++            return None
++        if "." in segment:
++            # A filename, not a handle.
++            continue
++        if _URL_PATH_RE.match(segment):
++            return segment
++    return None
+diff --git a/tools/connect-dl/pyproject.toml b/tools/connect-dl/pyproject.toml
+new file mode 100644
+index 0000000..d9e364a
+--- /dev/null
++++ b/tools/connect-dl/pyproject.toml
+@@ -0,0 +1,13 @@
++[project]
++name = "connect-dl"
++version = "1.0.0"
++description = "Download and rebuild Adobe Connect class recordings"
++requires-python = ">=3.9"
++dependencies = []          # standard library only; ffmpeg is an external tool
++
++[project.scripts]
++connect-dl = "connect_dl.cli:main"
++
++[build-system]
++requires = ["setuptools>=61"]
++build-backend = "setuptools.build_meta"
+diff --git a/tools/connect-dl/tests/test_connect_dl.py b/tools/connect-dl/tests/test_connect_dl.py
+new file mode 100644
+index 0000000..1db2200
+--- /dev/null
++++ b/tools/connect-dl/tests/test_connect_dl.py
+@@ -0,0 +1,281 @@
++"""Tests for connect-dl.  Run with:  python3 -m unittest discover tools/connect-dl/tests"""
++
++import os
++import struct
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from connect_dl.archive import Role, Stream, unpack
++from connect_dl.flv import scan_flv
++from connect_dl.index import parse_events
++from connect_dl.media import atempo_chain, build_audio_filter, build_video_filter
++from connect_dl.player import PlayerSources, write_player
++from connect_dl.urls import InvalidLink, parse_link
++
++
++# --------------------------------------------------------------- FLV builder
++
++def _amf_str(s):
++    b = s.encode()
++    return struct.pack(">H", len(b)) + b
++
++
++def _tag(kind, ts, payload):
++    return (
++        bytes([kind])
++        + len(payload).to_bytes(3, "big")
++        + (ts & 0xFFFFFF).to_bytes(3, "big")
++        + bytes([(ts >> 24) & 0xFF])
++        + b"\x00\x00\x00"
++        + payload
++        + struct.pack(">I", 11 + len(payload))
++    )
++
++
++def make_flv(path, *, start_ms, dur_ms, audio=None, video=None, w=0, h=0):
++    """A structurally valid FLV with the given codecs and timestamp range."""
++    props = {"duration": dur_ms / 1000.0}
++    if w:
++        props.update(width=float(w), height=float(h))
++    meta = b"\x02" + _amf_str("onMetaData") + b"\x08" + struct.pack(">I", len(props))
++    for key, value in props.items():
++        meta += _amf_str(key) + b"\x00" + struct.pack(">d", value)
++    meta += struct.pack(">H", 0) + b"\x09"
++
++    flags = (4 if audio else 0) | (1 if video else 0)
++    buf = b"FLV\x01" + bytes([flags]) + struct.pack(">I", 9) + struct.pack(">I", 0)
++    buf += _tag(18, 0, meta)
++    for i in range(5):
++        ts = start_ms + i * (dur_ms // 5)
++        if video:
++            buf += _tag(9, ts, bytes([0x10 | video]))
++        if audio:
++            buf += _tag(8, ts, bytes([(audio << 4) | 0x02]))
++    Path(path).write_bytes(buf)
++
++
++class TempRecording:
++    """A throwaway directory that looks like an unpacked Connect recording."""
++
++    def __enter__(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.path = Path(self._tmp.name)
++        return self
++
++    def __exit__(self, *exc):
++        self._tmp.cleanup()
++
++
++# ------------------------------------------------------------------- tests
++
++class TestUrls(unittest.TestCase):
++    def test_recording_link(self):
++        link = parse_link("https://acc.example.edu/p8fj3k2la9x/?pbMode=normal")
++        self.assertEqual(link.origin, "https://acc.example.edu")
++        self.assertEqual(link.url_path, "p8fj3k2la9x")
++        self.assertEqual(link.base, "https://acc.example.edu/p8fj3k2la9x/")
++
++    def test_connectpro_scheme_becomes_https(self):
++        link = parse_link("connectpro://vadavc41.ec.iau.ir/l993retztu2a/?session=abc")
++        self.assertEqual(link.origin, "https://vadavc41.ec.iau.ir")
++        self.assertEqual(link.url_path, "l993retztu2a")
++        self.assertEqual(link.session, "abc")
++
++    def test_bare_host_gets_a_scheme(self):
++        self.assertEqual(parse_link("acc.example.edu/p123abc").url_path, "p123abc")
++
++    def test_api_path_is_not_mistaken_for_a_sco(self):
++        link = parse_link("https://acc.example.edu/api/xml?action=sco-info&sco-id=12345")
++        self.assertIsNone(link.url_path)
++        self.assertEqual(link.sco_id, "12345")
++
++    def test_asset_url(self):
++        link = parse_link("https://acc.example.edu/p123abc/")
++        self.assertEqual(
++            link.asset("output/f.zip?download=zip"),
++            "https://acc.example.edu/p123abc/output/f.zip?download=zip",
++        )
++
++    def test_empty_is_rejected(self):
++        with self.assertRaises(InvalidLink):
++            parse_link("   ")
++
++
++class TestFlv(unittest.TestCase):
++    def test_reads_codecs_and_metadata(self):
++        with TempRecording() as rec:
++            f = rec.path / "cameraVoip_1_1.flv"
++            make_flv(f, start_ms=0, dur_ms=25000, audio=6, video=4, w=320, h=240)
++            info = scan_flv(f)
++            self.assertTrue(info.ok)
++            self.assertEqual(info.audio_codec, "nellymoser")
++            self.assertEqual(info.video_codec, "vp6")
++            self.assertEqual((info.width, info.height), (320, 240))
++            self.assertEqual(info.duration_ms, 25000)
++            self.assertTrue(info.needs_transcode)
++
++    def test_non_flv_is_reported_not_raised(self):
++        with TempRecording() as rec:
++            f = rec.path / "notes.txt"
++            f.write_text("hello")
++            self.assertEqual(scan_flv(f).error, "not an FLV file")
++
++
++class TestOffsets(unittest.TestCase):
++    """The alignment rules.  Getting these wrong reorders the lecture."""
++
++    def test_meeting_relative_timestamps_are_trusted_including_zero(self):
++        # Regression: a segment starting at t=0 is *resolved*, not unknown.
++        # Treating 0 as "no information" pushed the first half of the lecture
++        # to the end, behind the second half.
++        with TempRecording() as rec:
++            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=25000, audio=6)
++            make_flv(rec.path / "cameraVoip_1_2.flv", start_ms=35000, dur_ms=25000, audio=6)
++            archive = unpack(rec.path, rec.path)
++            offsets = {s.name: s.offset_ms for s in archive.streams}
++            self.assertEqual(offsets["cameraVoip_1_1.flv"], 0)
++            self.assertEqual(offsets["cameraVoip_1_2.flv"], 35000)
++            # the gap survives - it is a real silence in the lecture
++            self.assertEqual(archive.duration_ms, 60000)
++
++    def test_per_segment_timestamps_are_laid_end_to_end(self):
++        # When every segment restarts at zero the timestamps say nothing, so
++        # consecutive microphone segments must not stack on top of each other.
++        with TempRecording() as rec:
++            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=25000, audio=6)
++            make_flv(rec.path / "cameraVoip_1_2.flv", start_ms=0, dur_ms=25000, audio=6)
++            archive = unpack(rec.path, rec.path)
++            offsets = sorted(s.offset_ms for s in archive.streams)
++            self.assertEqual(offsets, [0, 25000])
++
++    def test_timeline_is_shifted_back_to_zero(self):
++        with TempRecording() as rec:
++            make_flv(rec.path / "screenshare_1_1.flv", start_ms=30000, dur_ms=60000, video=3, w=1024, h=768)
++            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=30000, dur_ms=60000, audio=6)
++            archive = unpack(rec.path, rec.path)
++            self.assertEqual(min(s.offset_ms for s in archive.streams), 0)
++
++    def test_roles_and_audio_source_preference(self):
++        with TempRecording() as rec:
++            make_flv(rec.path / "screenshare_1_1.flv", start_ms=0, dur_ms=60000, video=3, w=1024, h=768)
++            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6, video=4, w=320, h=240)
++            make_flv(rec.path / "mainstream.flv", start_ms=0, dur_ms=60000, audio=6, video=3, w=1024, h=768)
++            archive = unpack(rec.path, rec.path)
++            # the camera is preferred over the server's re-encoded composite
++            self.assertEqual([s.name for s in archive.audio_streams], ["cameraVoip_1_1.flv"])
++            self.assertEqual([s.name for s in archive.video_streams], ["screenshare_1_1.flv"])
++            roles = {s.name: s.role for s in archive.streams}
++            self.assertEqual(roles["screenshare_1_1.flv"], Role.SCREENSHARE)
++            self.assertEqual(roles["mainstream.flv"], Role.MAIN)
++
++    def test_mainstream_is_the_fallback_when_nothing_else_has_audio(self):
++        with TempRecording() as rec:
++            make_flv(rec.path / "mainstream.flv", start_ms=0, dur_ms=60000, audio=6, video=3, w=800, h=600)
++            archive = unpack(rec.path, rec.path)
++            self.assertEqual([s.name for s in archive.audio_streams], ["mainstream.flv"])
++
++
++class TestMedia(unittest.TestCase):
++    def test_atempo_chain_multiplies_out_to_the_request(self):
++        for speed in (0.25, 0.5, 0.75, 1.5, 2, 2.5, 3, 4, 8):
++            chain = atempo_chain(speed)
++            product = 1.0
++            for part in chain.split(","):
++                product *= float(part.split("=")[1])
++            self.assertAlmostEqual(product, speed, places=9, msg=f"speed={speed}")
++            for part in chain.split(","):
++                factor = float(part.split("=")[1])
++                self.assertTrue(0.5 <= factor <= 2.0, f"{factor} out of atempo range")
++
++    def test_atempo_identity(self):
++        self.assertEqual(atempo_chain(1.0), "anull")
++
++    def test_audio_filter_delays_later_segments(self):
++        streams = [
++            Stream(path=Path("a.flv"), role=Role.CAMERA, offset_ms=0),
++            Stream(path=Path("b.flv"), role=Role.CAMERA, offset_ms=2670000),
++        ]
++        graph, label = build_audio_filter(streams)
++        self.assertEqual(label, "[aout]")
++        self.assertIn("adelay=2670000:all=1", graph)
++        self.assertIn("amix=inputs=2", graph)
++        # the first stream must not be delayed
++        self.assertNotIn("[0:a]aresample=async=1:first_pts=0,aformat=sample_fmts=fltp:"
++                         "sample_rates=48000:channel_layouts=mono,adelay", graph)
++
++    def test_video_filter_opens_each_file_once(self):
++        cam = Stream(path=Path("cameraVoip_1_1.flv"), role=Role.CAMERA, offset_ms=0)
++        screen = Stream(path=Path("screenshare_1_1.flv"), role=Role.SCREENSHARE, offset_ms=0)
++        graph, inputs, vlabel, alabel = build_video_filter(
++            [screen], [cam], [cam], width=1280, height=720, fps=5, duration_s=60.0
++        )
++        # the camera supplies both picture and sound but is a single input
++        self.assertEqual(len(inputs), 2)
++        self.assertEqual(vlabel, "[vout]")
++        self.assertEqual(alabel, "[aout]")
++        self.assertNotIn("[base]", graph)
++
++    def test_video_filter_offsets_use_tpad(self):
++        late = Stream(path=Path("s2.flv"), role=Role.SCREENSHARE, offset_ms=35000)
++        graph, _, _, _ = build_video_filter(
++            [late], [], [], width=1280, height=720, fps=5, duration_s=60.0
++        )
++        self.assertIn("tpad=start_duration=35.000", graph)
++
++
++class TestEvents(unittest.TestCase):
++    def test_shift_dedupe_and_range_filtering(self):
++        with TempRecording() as rec:
++            (rec.path / "ftchat.xml").write_text(
++                '<chat><message time="65000" from="Prof">&lt;b&gt;Hello&lt;/b&gt; all</message>'
++                '<message time="65000" from="Prof">&lt;b&gt;Hello&lt;/b&gt; all</message></chat>'
++            )
++            (rec.path / "indexstream.xml").write_text(
++                '<index><event time="30000" name="Start"/>'
++                '<event time="99999999" name="past the end"/></index>'
++            )
++            events = parse_events(
++                [rec.path / "ftchat.xml", rec.path / "indexstream.xml"],
++                shift_ms=30000, duration_ms=600000,
++            )
++            self.assertEqual([m.label for m in events.markers], ["Start"])
++            self.assertEqual(len(events.chat), 1)                 # deduped
++            self.assertEqual(events.chat[0].message, "Hello all")  # markup stripped
++            self.assertEqual(events.chat[0].time_ms, 35000)        # shifted
++
++
++class TestPlayer(unittest.TestCase):
++    def test_writes_a_self_contained_page(self):
++        with TempRecording() as rec:
++            out = write_player(
++                rec.path / "play.html",
++                title='Lecture <7> & "friends"',
++                sources=PlayerSources(video="v.mp4", audio="a.mp3"),
++                events=parse_events([]),
++                duration_s=60.0,
++            )
++            html = out.read_text()
++            self.assertNotIn("__TITLE__", html)
++            self.assertNotIn("/*__DATA__*/null", html)
++            self.assertIn("&lt;7&gt;", html)          # title escaped
++            self.assertIn("playbackRate", html)       # the whole point
++            self.assertIn("preservesPitch", html)
++
++
++class TestArchiveSafety(unittest.TestCase):
++    def test_zip_slip_is_refused(self):
++        import zipfile
++        with TempRecording() as rec:
++            evil = rec.path / "evil.zip"
++            with zipfile.ZipFile(evil, "w") as zf:
++                zf.writestr("../escaped.txt", "nope")
++            with self.assertRaises(ValueError):
++                unpack(evil, rec.path / "out")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.43.0
+
