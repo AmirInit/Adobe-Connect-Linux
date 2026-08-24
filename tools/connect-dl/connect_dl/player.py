@@ -20,9 +20,13 @@ from pathlib import Path
 
 from .index import Events
 
-__all__ = ["write_player"]
+__all__ = ["write_player", "SPEEDS"]
 
-SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4]
+# The visible speed buttons.  These go far past what a normal player offers on
+# purpose: skimming a two-hour class back at 8x or 16x to find the part you
+# needed is the whole reason this page exists.  Fine adjustment in 0.25 steps
+# is on the up/down arrows, and applyRate clamps anything to 0.25 - 16.
+SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 6, 8, 12, 16]
 
 
 @dataclass
@@ -113,6 +117,28 @@ _TEMPLATE = r"""<!doctype html>
   .speeds button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
   .clock { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
   .rate-badge { font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .rate-badge.fast { color: #ffc46b; }
+
+  /* Scrub bar with a tick for every chapter, so the shape of the lecture is
+     visible at a glance and a chapter is one click away. */
+  .scrub {
+    position: relative; height: 22px; cursor: pointer; background: var(--panel);
+    border-top: 1px solid var(--line); flex: 0 0 auto;
+  }
+  .scrub .track {
+    position: absolute; left: 0; right: 0; top: 9px; height: 4px;
+    background: #333945; border-radius: 2px;
+  }
+  .scrub .played { position: absolute; left: 0; top: 9px; height: 4px; width: 0; background: var(--accent); border-radius: 2px; }
+  .scrub .head {
+    position: absolute; top: 5px; width: 12px; height: 12px; margin-left: -6px;
+    border-radius: 50%; background: var(--fg); pointer-events: none;
+  }
+  .scrub .tick {
+    position: absolute; top: 4px; width: 2px; height: 14px; margin-left: -1px;
+    background: var(--muted); opacity: .8;
+  }
+  .scrub .tick:hover { background: var(--fg); }
 
   aside {
     width: 340px; flex: 0 0 340px; border-left: 1px solid var(--line);
@@ -125,6 +151,13 @@ _TEMPLATE = r"""<!doctype html>
   }
   .tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
   .list { overflow-y: auto; flex: 1; padding: 6px; }
+  .filter { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  .filter input {
+    width: 100%; background: #14161a; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px;
+  }
+  .filter input:focus { outline: none; border-color: var(--accent); }
+  .row[hidden] { display: none; }
   .row {
     display: flex; gap: 10px; padding: 7px 8px; border-radius: 6px;
     cursor: pointer; align-items: baseline;
@@ -151,11 +184,17 @@ _TEMPLATE = r"""<!doctype html>
 <header>
   <h1 id="title"></h1>
   <span class="meta" id="meta"></span>
+  <span class="meta" id="now-chapter"></span>
 </header>
 
 <main>
   <div class="stage">
     <div id="media"></div>
+    <div class="scrub" id="scrub" title="click to seek">
+      <div class="track"></div>
+      <div class="played" id="played"></div>
+      <div class="head" id="head"></div>
+    </div>
     <div class="transport">
       <button id="play">Play</button>
       <button data-seek="-30">&#171; 30s</button>
@@ -173,12 +212,15 @@ _TEMPLATE = r"""<!doctype html>
       <button data-tab="chapters" class="on">Chapters</button>
       <button data-tab="chat">Chat</button>
     </div>
+    <div class="filter" id="filter-box" hidden>
+      <input id="filter" type="search" placeholder="filter the chat&hellip;" autocomplete="off">
+    </div>
     <div class="list" id="chapters"></div>
     <div class="list" id="chat" hidden></div>
     <div class="notes">
       <div><kbd>space</kbd> play &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> 10s &middot;
            <kbd>J</kbd><kbd>L</kbd> 30s &middot; <kbd>&uarr;</kbd><kbd>&darr;</kbd> speed &middot;
-           <kbd>0</kbd> reset speed</div>
+           <kbd>0</kbd> 1x &middot; <kbd>Home</kbd>/<kbd>End</kbd> start/end</div>
       <ul id="notes"></ul>
     </div>
   </aside>
@@ -232,6 +274,10 @@ let rate = saved.rate || 1;
 
 function applyRate(r) {
   rate = Math.min(16, Math.max(0.25, Math.round(r * 100) / 100));
+  // Everything on this page is driven from media.currentTime, so setting the
+  // element's rate is the *only* thing speed has to change: the picture, the
+  // sound, the chat highlight and the chapter follow all move together at the
+  // new rate because they all read the same clock.
   media.playbackRate = rate;
   // Keep pitch correction on where the browser exposes it, so a 2x lecture
   // still sounds like the lecturer rather than a chipmunk.
@@ -239,6 +285,7 @@ function applyRate(r) {
   media.mozPreservesPitch = true;
   media.webkitPreservesPitch = true;
   $("rate").textContent = rate + "x";
+  $("rate").classList.toggle("fast", rate >= 4);
   for (const b of $("speeds").children) b.classList.toggle("on", Number(b.dataset.rate) === rate);
   persist();
 }
@@ -253,12 +300,36 @@ for (const s of DATA.speeds) {
 }
 
 // ---- transport -----------------------------------------------------------
+const total = () => (isFinite(media.duration) && media.duration > 0) ? media.duration : DATA.duration;
+const seekTo = (t) => { media.currentTime = Math.max(0, Math.min(total() - 0.25, t)); };
+const seekBy = (d) => seekTo(media.currentTime + d);
+
 $("play").onclick = () => media.paused ? media.play() : media.pause();
-media.addEventListener("play", () => $("play").textContent = "Pause");
+media.addEventListener("play", () => { $("play").textContent = "Pause"; follow(); });
 media.addEventListener("pause", () => $("play").textContent = "Play");
 for (const b of document.querySelectorAll("[data-seek]")) {
-  b.onclick = () => { media.currentTime += Number(b.dataset.seek); };
+  b.onclick = () => seekBy(Number(b.dataset.seek));
 }
+
+// ---- scrub bar with a tick per chapter -----------------------------------
+const scrub = $("scrub");
+function layTicks() {
+  for (const el of scrub.querySelectorAll(".tick")) el.remove();
+  const dur = total();
+  if (!dur) return;
+  for (const m of DATA.markers) {
+    const tick = document.createElement("div");
+    tick.className = "tick";
+    tick.style.left = (100 * Math.min(1, m.t / dur)) + "%";
+    tick.title = fmt(m.t) + "  " + m.label;
+    tick.onclick = (e) => { e.stopPropagation(); seekTo(m.t); };
+    scrub.appendChild(tick);
+  }
+}
+scrub.onclick = (e) => {
+  const box = scrub.getBoundingClientRect();
+  seekTo(((e.clientX - box.left) / box.width) * total());
+};
 
 let persistTimer = null;
 function persist() {
@@ -270,9 +341,10 @@ function persist() {
 
 media.addEventListener("loadedmetadata", () => {
   applyRate(rate);
-  if (saved.time && saved.time < (media.duration || DATA.duration) - 5) {
-    media.currentTime = saved.time;
-  }
+  layTicks();
+  // Pick up where this recording was left off, unless that was the very end.
+  if (saved.time && saved.time < total() - 5) media.currentTime = saved.time;
+  tick();
 });
 
 // ---- sidebar -------------------------------------------------------------
@@ -285,7 +357,8 @@ function fill(container, items, render) {
     const row = document.createElement("div");
     row.className = "row";
     row.innerHTML = render(item);
-    row.onclick = () => { media.currentTime = item.t; media.play(); };
+    // Clicking a line is the fastest way to get to the moment it belongs to.
+    row.onclick = () => { seekTo(item.t); media.play(); };
     container.appendChild(row);
     return row;
   });
@@ -304,10 +377,23 @@ const chatRows = fill($("chat"), DATA.chat,
 for (const b of document.querySelectorAll("[data-tab]")) {
   b.onclick = () => {
     for (const o of document.querySelectorAll("[data-tab]")) o.classList.toggle("on", o === b);
-    $("chapters").hidden = b.dataset.tab !== "chapters";
-    $("chat").hidden = b.dataset.tab !== "chat";
+    const chat = b.dataset.tab === "chat";
+    $("chapters").hidden = chat;
+    $("chat").hidden = !chat;
+    $("filter-box").hidden = !chat || !DATA.chat.length;
   };
 }
+
+// Filtering hides rows without disturbing the follow logic, which indexes the
+// full list and simply skips over anything hidden when scrolling.
+$("filter").oninput = () => {
+  const needle = $("filter").value.trim().toLowerCase();
+  chatRows.forEach((row, i) => {
+    const c = DATA.chat[i];
+    row.hidden = needle !== "" &&
+      !((c.msg || "") + " " + (c.from || "")).toLowerCase().includes(needle);
+  });
+};
 
 const notes = $("notes");
 for (const n of DATA.notes) {
@@ -317,6 +403,9 @@ for (const n of DATA.notes) {
 }
 
 // ---- follow playback -----------------------------------------------------
+// Everything below reads media.currentTime and nothing else.  No wall-clock
+// timer, no counter of its own: at 1x or at 16x the sidebar cannot drift away
+// from the picture, because it is asking the picture what time it is.
 function highlight(rows, items) {
   let active = -1;
   for (let i = 0; i < items.length; i++) if (items[i].t <= media.currentTime + 0.25) active = i;
@@ -324,31 +413,67 @@ function highlight(rows, items) {
   return active;
 }
 
-let lastChat = -1;
-media.addEventListener("timeupdate", () => {
-  $("clock").textContent = fmt(media.currentTime) + " / " + fmt(media.duration || DATA.duration);
-  highlight(chapterRows, DATA.markers);
+let lastChat = -1, lastChapter = -1;
+function tick() {
+  const dur = total(), at = media.currentTime;
+  $("clock").textContent = fmt(at) + " / " + fmt(dur);
+  const pct = dur ? (100 * Math.min(1, at / dur)) : 0;
+  $("played").style.width = pct + "%";
+  $("head").style.left = pct + "%";
+
+  const c = highlight(chapterRows, DATA.markers);
+  if (c !== lastChapter) {
+    lastChapter = c;
+    $("now-chapter").textContent = c >= 0 ? "· " + DATA.markers[c].label : "";
+    if (c >= 0 && !$("chapters").hidden) chapterRows[c].scrollIntoView({ block: "nearest" });
+  }
   const i = highlight(chatRows, DATA.chat);
-  if (i !== lastChat && i >= 0 && !$("chat").hidden) {
-    chatRows[i].scrollIntoView({ block: "nearest" });
+  if (i !== lastChat) {
     lastChat = i;
+    if (i >= 0 && !$("chat").hidden && !chatRows[i].hidden) {
+      chatRows[i].scrollIntoView({ block: "nearest" });
+    }
   }
   persist();
-});
+}
+
+// timeupdate alone fires about four times a second, which at 12x is nearly
+// three seconds of lecture per update - visibly behind.  A frame loop while
+// playing keeps it smooth; timeupdate still covers seeking and pauses.
+let following = false;
+function follow() {
+  if (following) return;
+  following = true;
+  const step = () => {
+    if (media.paused || media.ended) { following = false; tick(); return; }
+    tick();
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+media.addEventListener("timeupdate", () => { if (media.paused) tick(); });
+media.addEventListener("seeked", tick);
+media.addEventListener("durationchange", layTicks);
 
 // ---- keyboard ------------------------------------------------------------
 addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
   const step = 0.25;
   switch (e.key) {
-    case " ": case "k": media.paused ? media.play() : media.pause(); break;
-    case "ArrowLeft":  media.currentTime -= 10; break;
-    case "ArrowRight": media.currentTime += 10; break;
-    case "j": media.currentTime -= 30; break;
-    case "l": media.currentTime += 30; break;
+    case " ": case "k": case "K": media.paused ? media.play() : media.pause(); break;
+    case "ArrowLeft":  seekBy(-10); break;
+    case "ArrowRight": seekBy(10); break;
+    case "j": case "J": seekBy(-30); break;
+    case "l": case "L": seekBy(30); break;
     case "ArrowUp":   applyRate(rate + step); break;
     case "ArrowDown": applyRate(rate - step); break;
     case "0": applyRate(1); break;
+    case "Home": seekTo(0); break;
+    case "End": seekTo(total() - 1); break;
+    case "/":
+      document.querySelector('[data-tab="chat"]').click();
+      $("filter").focus();
+      break;
     default: return;
   }
   e.preventDefault();

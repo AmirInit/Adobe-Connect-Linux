@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import webbrowser
 from pathlib import Path
 
 from . import __version__
@@ -86,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("url")
     auth_options(listing)
 
+    play = sub.add_parser("play", help="open a rebuilt recording's player in your browser")
+    play.add_argument("path", type=Path, nargs="?", default=Path("."),
+                      help="the output folder (or the play.html itself); defaults to here")
+
     return parser
 
 
@@ -102,6 +107,8 @@ def _output_options(p: argparse.ArgumentParser) -> None:
                         "Only needed for players with no speed control - the "
                         "generated page can already play at any rate.")
     g.add_argument("--no-player", action="store_true", help="do not generate the HTML player")
+    g.add_argument("--no-open", action="store_true",
+                   help="do not open the player in a browser when the rebuild finishes")
     g.add_argument("--only-speaker", type=int, metavar="N",
                    help="keep just one speaker's microphone; run 'inspect' to see who is who")
     g.add_argument("--layout", choices=LAYOUTS, default="auto",
@@ -150,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         return {
-            "get": cmd_get, "rebuild": cmd_rebuild,
-            "inspect": cmd_inspect, "list": cmd_list,
+            "get": cmd_get, "rebuild": cmd_rebuild, "inspect": cmd_inspect,
+            "list": cmd_list, "play": cmd_play,
         }[args.command](args)
     except (ConnectError, InvalidLink, FFmpegMissing, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -286,6 +293,47 @@ def cmd_inspect(args) -> int:
     events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
     print(f"\nchapters: {len(events.markers)}   chat lines: {len(events.chat)}")
     return 0
+
+
+def cmd_play(args) -> int:
+    """Open a previously rebuilt recording in the browser."""
+    page = find_player(args.path)
+    if page is None:
+        raise ConnectError(
+            f"no play.html under {args.path}. Rebuild the recording first:\n"
+            f"  connect-dl rebuild {args.path}"
+        )
+    print(f"opening {page}")
+    if not open_in_browser(page):
+        print("could not launch a browser; open that file yourself.")
+    return 0
+
+
+def find_player(path: Path) -> Path | None:
+    """Locate the play.html for a folder (or accept the file itself)."""
+    path = path.expanduser()
+    if path.is_file() and path.suffix.lower() in (".html", ".htm"):
+        return path
+    direct = path / "play.html"
+    if direct.is_file():
+        return direct
+    found = sorted(path.glob("*/play.html")) if path.is_dir() else []
+    return found[0] if found else None
+
+
+def open_in_browser(page: Path) -> bool:
+    """Open a local file in the default browser.  False if that is impossible.
+
+    Headless machines, ssh sessions and CI have no browser to open, and that is
+    not an error worth failing a finished download over.
+    """
+    if os.environ.get("CONNECT_DL_NO_BROWSER"):
+        return False
+    try:
+        return webbrowser.open(page.resolve().as_uri())
+    except (webbrowser.Error, OSError, ValueError) as exc:
+        log.debug("could not open a browser: %s", exc)
+        return False
 
 
 def _level(archive: RecordingArchive) -> list:
@@ -444,6 +492,7 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
             notes.append("Video rendering failed; the audio track is unaffected.")
             video_path = None
 
+    page = None
     if not args.no_player and not args.dry_run and (audio_path or video_path):
         events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
         page = write_player(
@@ -464,6 +513,15 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
         print("\nnotes:")
         for note in notes:
             print(f"  - {note}")
+
+    # One command, paste a link, watch the class: the last step of a successful
+    # run is the player already being on screen.
+    if page and not args.no_open:
+        if open_in_browser(page):
+            print(f"\nopened {page.name} in your browser.")
+        else:
+            print(f"\nopen {page} in a browser to watch it "
+                  f"(or run: connect-dl play {out_dir})")
     return 0
 
 
