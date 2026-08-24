@@ -52,27 +52,31 @@ Example:
 ## Downloading recordings
 
 Joining a live class is only half of what this repository is for. `tools/connect-dl`
-downloads a **recorded** class and rebuilds it into files you can actually play —
-above all a single continuous audio track of the lecturer's voice, which you can
-then listen to at any speed.
+downloads a **recorded** class and rebuilds it into files you can actually play.
 
 ```bash
-sudo apt install ffmpeg          # the one external dependency
+sudo apt install ffmpeg          # or: brew install ffmpeg
 
-# download a recording and rebuild it
-./tools/connect-dl/connect-dl get "https://connect.example.edu/p8fj3k2la9x/" \
-    -u you@example.edu -o ./class07
+./tools/connect-dl/connect-dl get
 ```
 
-You get the lecture as an `.mp3`, a reconstructed `.mp4` of the shared screen
-with the webcam and audio, and a `play.html` offline player with a **playback
-speed control** (0.75×–4×, pitch-corrected) plus chapter and chat sidebars —
-the thing Connect's own player never offered.
+That is the whole command. It asks for the link, takes the session token out of
+it if there is one, downloads the recording, rebuilds it, and opens the player
+in your browser. You end up with the lecture as an `.mp3` (one continuous track,
+every microphone levelled against the others), a reconstructed `.mp4` of the
+shared screen with the webcam and audio, the chat and chapters as text, and a
+self-contained `play.html` with a **0.5×–16× speed control** — pitch-corrected,
+with the chat and chapter sidebars staying in sync at every speed. That last
+part is the thing Connect's own player never offered.
 
 Signing in through university SSO? Copy the `BREEZESESSION` cookie out of a
-logged-in browser and pass `--session`. Full documentation, including how to fix
-a stream that plays out of sync, is in
-[tools/connect-dl/README.md](tools/connect-dl/README.md).
+logged-in browser and pass `--session`. Full documentation — the cookie, the
+options, watching a class back, and what to do when something comes out wrong —
+is in [tools/connect-dl/README.md](tools/connect-dl/README.md).
+
+**The downloader is independent of the client above.** It uses no CEF and no
+Flash, is not affected by the CEF 86 pin, and runs anywhere Python and ffmpeg
+run — including machines where the live-meeting client could not work at all.
 
 ## FAQ
 If the app does not open, try the following command:
