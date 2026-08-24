@@ -18,11 +18,19 @@ Offsets are resolved in descending order of trustworthiness:
 
 1. a start time stated for that file in one of the XML sidecars,
 2. the file's own first media timestamp (Connect frequently leaves these as
-   meeting-relative rather than resetting them to zero),
+   meeting-relative rather than resetting them to zero) - but only when those
+   timestamps are *large* enough to be positions rather than packet jitter; see
+   :func:`_timestamps_are_positions`,
 3. laying the segments end to end in file-name order.
 
 Which rule fired is recorded per stream and printed, because rule 3 is a guess
 and the user may need to correct it with --offset.
+
+Not everything in the archive is media.  ``ftchat*``, ``ftcontent*``,
+``indexstream*`` and ``transcriptstream*`` are FLV *containers* carrying chat,
+whiteboard draw-commands and the seek index.  They are classified as
+:attr:`Role.METADATA` and never handed to ffmpeg as media - doing so is what
+makes a render "succeed" while producing the wrong thing.
 """
 
 from __future__ import annotations
@@ -39,11 +47,30 @@ from .flv import FlvInfo, scan_flv
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Role", "Stream", "RecordingArchive", "unpack"]
+__all__ = ["Role", "Stream", "RecordingArchive", "unpack", "METADATA_PREFIXES", "LAYOUTS"]
 
 _SEQ_RE = re.compile(r"(\d+)")
+# Connect names microphone segments cameraVoip_<speaker>_<sequence>.flv, where
+# <sequence> counts across the whole archive.  That number is the only reliable
+# ordering when the timestamps turn out to be useless.
+_SPEAKER_SEQ_RE = re.compile(r"^([A-Za-z]+)_(\d+)_(\d+)", re.A)
 _TIME_ATTRS = ("start", "starttime", "start-time", "begin", "offset", "time", "ts", "timestamp")
 _AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav"}
+
+# FLV by extension, but they carry chat, the whiteboard draw-commands, the seek
+# index and the transcript - not media.
+METADATA_PREFIXES = (
+    "ftchat", "ftcontent", "indexstream", "transcriptstream",
+    "ftnote", "ftpoll", "ftquestion", "ftshare",
+)
+
+LAYOUTS = ("auto", "timeline", "sequential")
+
+# How far apart the segment start times must be spread before they are read as
+# positions in the meeting rather than as start-up jitter.  See
+# _timestamps_are_positions().
+_MIN_SPREAD_MS = 30_000
+_SPREAD_FRACTION = 4
 
 
 class Role(str, Enum):
@@ -51,12 +78,16 @@ class Role(str, Enum):
     CAMERA = "camera"             # webcam video, usually carries the mic audio
     VOICE = "voice"               # audio-only stream (VoIP or telephony bridge)
     MAIN = "main"                 # mainstream.flv, the server's own composite
-    INDEX = "index"               # indexstream.flv, events not media
+    METADATA = "metadata"         # chat / index / whiteboard streams, not media
     OTHER = "other"
 
     @property
     def is_audio_source(self) -> bool:
         return self in (Role.CAMERA, Role.VOICE, Role.MAIN)
+
+    @property
+    def is_media(self) -> bool:
+        return self is not Role.METADATA
 
 
 @dataclass
@@ -67,9 +98,29 @@ class Stream:
     offset_ms: int = 0
     offset_source: str = "unresolved"
 
+    # Filled in by connect_dl.levels when microphone levelling is enabled.
+    mean_db: float | None = None
+    max_db: float | None = None
+    gain_db: float = 0.0
+
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def speaker(self) -> int:
+        """Which microphone this segment came from, per the file name.
+
+        ``cameraVoip_3_11.flv`` is speaker 3.  Zero when the name says nothing.
+        """
+        match = _SPEAKER_SEQ_RE.match(self.path.stem)
+        return int(match.group(2)) if match else 0
+
+    @property
+    def seq(self) -> int:
+        """Connect's archive-wide segment number, or 0 when absent."""
+        match = _SPEAKER_SEQ_RE.match(self.path.stem)
+        return int(match.group(3)) if match else 0
 
     @property
     def duration_ms(self) -> int:
@@ -96,10 +147,15 @@ class Stream:
 
     def describe(self) -> str:
         detail = self.info.describe() if self.info else "(non-FLV)"
-        return (
+        line = (
             f"{self.name:<28} {self.role.value:<11} @{self.offset_ms / 1000:8.1f}s  "
             f"{detail}  [{self.offset_source}]"
         )
+        if self.mean_db is not None:
+            line += f"  {self.mean_db:6.1f}dB"
+            if self.gain_db >= 0.5:
+                line += f" +{self.gain_db:.0f}"
+        return line
 
 
 @dataclass
@@ -108,6 +164,7 @@ class RecordingArchive:
     streams: list[Stream] = field(default_factory=list)
     xml_files: list[Path] = field(default_factory=list)
     title: str | None = None
+    layout: str = "timeline"
 
     # ------------------------------------------------------------ selection
 
@@ -117,6 +174,13 @@ class RecordingArchive:
             (s for s in self.streams if s.role in wanted),
             key=lambda s: (s.offset_ms, s.sequence),
         )
+
+    def audio_for(self, only_speaker: int | None = None) -> list[Stream]:
+        """Voice streams, optionally narrowed to one speaker's microphone."""
+        streams = self.audio_streams
+        if only_speaker is None:
+            return streams
+        return [s for s in streams if s.speaker == only_speaker]
 
     @property
     def audio_streams(self) -> list[Stream]:
@@ -131,6 +195,19 @@ class RecordingArchive:
         return [s for s in self.by_role(Role.MAIN) if s.has_audio]
 
     @property
+    def metadata_streams(self) -> list[Stream]:
+        """Chat / index / whiteboard containers - deliberately not media."""
+        return [s for s in self.streams if s.role is Role.METADATA]
+
+    def speaker_totals(self) -> dict[int, int]:
+        """Milliseconds of microphone time per speaker, for the inspect report."""
+        totals: dict[int, int] = {}
+        for stream in self.streams:
+            if stream.role.is_audio_source and stream.has_audio:
+                totals[stream.speaker] = totals.get(stream.speaker, 0) + stream.duration_ms
+        return totals
+
+    @property
     def video_streams(self) -> list[Stream]:
         primary = [s for s in self.by_role(Role.SCREENSHARE) if s.has_video]
         if primary:
@@ -143,26 +220,41 @@ class RecordingArchive:
 
     @property
     def duration_ms(self) -> int:
-        return max((s.end_ms for s in self.streams if s.role != Role.INDEX), default=0)
+        return max((s.end_ms for s in self.streams if s.role.is_media), default=0)
 
     def summary(self) -> str:
         lines = [f"archive: {self.root}"]
         if self.title:
             lines.append(f"title:   {self.title}")
         lines.append(f"length:  {self.duration_ms / 1000 / 60:.1f} min")
+        lines.append(f"layout:  {self.layout} ({_LAYOUT_NOTE[self.layout]})")
         lines.append("streams:")
-        lines += ["  " + s.describe() for s in sorted(self.streams, key=lambda s: (s.role.value, s.sequence))]
+        media = [s for s in self.streams if s.role.is_media]
+        lines += ["  " + s.describe() for s in sorted(media, key=lambda s: (s.offset_ms, s.seq, s.name))]
+        meta = self.metadata_streams
+        if meta:
+            lines.append("metadata (not media): " + ", ".join(sorted(s.name for s in meta)))
         if not self.audio_streams:
             lines.append("  !! no audio-bearing stream found")
         return "\n".join(lines)
 
 
-def unpack(payload: Path, dest: Path) -> RecordingArchive:
+_LAYOUT_NOTE = {
+    "timeline": "segments kept their stamped meeting positions; gaps stay silent",
+    "sequential": "the stamps were jitter, not positions, so segments play back to back",
+}
+
+
+def unpack(payload: Path, dest: Path, *, layout: str = "auto") -> RecordingArchive:
     """Analyse a recording, extracting it first if it is still a zip.
 
     ``payload`` may be a zip file, an already-unpacked directory, or a loose
-    media file; ``dest`` is only used in the zip case.
+    media file; ``dest`` is only used in the zip case.  ``layout`` overrides how
+    segments are placed in time - see :func:`_resolve_offsets`.
     """
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout {layout!r}; choose one of {', '.join(LAYOUTS)}")
+
     if payload.is_dir():
         root = payload
     elif zipfile.is_zipfile(payload):
@@ -174,7 +266,7 @@ def unpack(payload: Path, dest: Path) -> RecordingArchive:
 
     archive = RecordingArchive(root=root)
     _collect(archive, root)
-    _resolve_offsets(archive)
+    archive.layout = _resolve_offsets(archive, layout=layout)
     archive.title = _find_title(archive)
     return archive
 
@@ -201,7 +293,9 @@ def _collect(archive: RecordingArchive, root: Path) -> None:
         if suffix == ".flv":
             info = scan_flv(path)
             role = _classify(path, info)
-            if info.error:
+            # A metadata stream having no media tags is the normal case, not a
+            # fault worth warning about.
+            if info.error and role.is_media:
                 log.warning("%s: %s", path.name, info.error)
             archive.streams.append(Stream(path=path, role=role, info=info))
         elif suffix in _AUDIO_EXTS:
@@ -210,15 +304,20 @@ def _collect(archive: RecordingArchive, root: Path) -> None:
 
 def _classify(path: Path, info: FlvInfo) -> Role:
     stem = path.stem.lower()
+    # The name settles this before the container is consulted: these files are
+    # FLVs holding events, and an event stream that happens to contain a stray
+    # media tag must still never reach ffmpeg as a media input.
+    if stem.startswith(METADATA_PREFIXES):
+        return Role.METADATA
     if stem.startswith("screenshare") or "screen" in stem:
         return Role.SCREENSHARE
     if "cameravoip" in stem or stem.startswith("camera"):
         return Role.CAMERA
     if "voice" in stem or "voip" in stem or "telephony" in stem or "audio" in stem:
         return Role.VOICE
-    if stem.startswith("indexstream"):
-        return Role.INDEX
     if stem.startswith("mainstream"):
+        # Often a data-only stub with no media tags at all; the has_audio /
+        # has_video checks on the way into a render filter catch that.
         return Role.MAIN
     # Unknown name: fall back to what the container actually holds.
     if info.has_video:
@@ -230,56 +329,113 @@ def _classify(path: Path, info: FlvInfo) -> Role:
 
 # ------------------------------------------------------------------ offsets
 
-def _resolve_offsets(archive: RecordingArchive) -> None:
-    hints = _offset_hints(archive.xml_files)
+def _resolve_offsets(archive: RecordingArchive, *, layout: str = "auto") -> str:
+    """Place every stream on one timeline; returns the layout that was used.
 
-    # Connect writes FLV timestamps one of two ways, and which one is in use
-    # decides how a segment starting at t=0 should be read.
-    #
-    #   meeting-relative : every segment is stamped with its position in the
-    #                      meeting, so 0 genuinely means "from the start".
-    #   per-segment      : every segment restarts at 0, so a 0 says nothing at
-    #                      all and the segments have to be laid end to end.
-    #
-    # A single non-zero start anywhere in the recording settles it: only the
-    # first style can produce one.  Getting this wrong is not a subtle
-    # mis-sync - it reorders halves of the lecture - so it is decided once for
-    # the whole archive rather than per file.
-    media = [s for s in archive.streams if s.info and s.info.ok]
-    meeting_relative = any(s.info.first_media_ts > 0 for s in media)
-    log.info(
-        "stream timestamps look %s",
-        "meeting-relative" if meeting_relative else "per-segment (each restarts at zero)",
-    )
+    ``layout`` is ``"auto"`` (decide from the evidence), ``"timeline"`` (trust
+    the stated/stamped positions) or ``"sequential"`` (ignore them and lay the
+    segments end to end).  An explicit choice overrides *all* the evidence,
+    including the XML sidecars, because a user reaching for the flag has already
+    watched the automatic answer be wrong.
+    """
+    media = [s for s in archive.streams if s.role.is_media and s.info and s.info.ok]
+
+    if layout == "sequential":
+        _lay_end_to_end(archive, everything=True)
+        _normalise(archive)
+        return "sequential"
+
+    hints = _offset_hints(archive.xml_files)
+    stamped = True if layout == "timeline" else _timestamps_are_positions(media)
 
     for stream in archive.streams:
         key = stream.path.stem.lower()
         if key in hints:
             stream.offset_ms = hints[key]
             stream.offset_source = "xml"
-        elif meeting_relative and stream.info and stream.info.ok:
+        elif stamped and stream.info and stream.info.ok:
             stream.offset_ms = stream.info.first_media_ts
             stream.offset_source = "flv-timestamp"
 
-    # Anything still unplaced gets laid end to end within its own role, so that
-    # consecutive microphone segments do not stack on top of each other.
+    _lay_end_to_end(archive, everything=False)
+    _normalise(archive)
+    return "timeline" if (stamped or hints) else "sequential"
+
+
+def _timestamps_are_positions(media: list[Stream]) -> bool:
+    """Do the FLV timestamps say *where* in the meeting each segment belongs?
+
+    Connect writes them one of two ways, and which one is in use decides how a
+    segment starting at t=0 should be read:
+
+      meeting-relative : every segment is stamped with its position in the
+                         meeting, so 0 genuinely means "from the start".
+      per-segment      : every segment restarts near 0, so the stamp says
+                         nothing and the segments have to be laid end to end.
+
+    Telling them apart by "is any start non-zero?" is wrong, and wrong in a way
+    that ruins the output.  On a real 38-minute recording six microphone
+    segments all began within 4.4 seconds of each other - start-up jitter, not
+    positions - yet every one of them was non-zero, so all six were stacked on
+    top of each other and everybody talked at once.
+
+    The question is one of magnitude.  Real meeting positions spread across the
+    whole lecture, so the gap between the first and last start is comparable to
+    the material itself; jitter is a rounding error next to it.  The stamps are
+    only trusted when their spread reaches a quarter of the longest single
+    track, and at least 30 seconds.
+    """
+    if not media:
+        return False
+
+    starts = [s.info.first_media_ts for s in media]
+    spread = max(starts) - min(starts)
+
+    # "How long would this lecture be if its segments were laid end to end?" -
+    # measured per role, since a screen share running underneath the microphone
+    # segments doubles a whole-archive sum without lengthening the lecture.
+    per_role: dict[Role, int] = {}
+    for stream in media:
+        per_role[stream.role] = per_role.get(stream.role, 0) + stream.duration_ms
+    content_ms = max(per_role.values(), default=0)
+
+    threshold = max(_MIN_SPREAD_MS, content_ms // _SPREAD_FRACTION)
+    trusted = spread >= threshold
+    log.info(
+        "segment starts span %.1fs against a %.1fs threshold: timestamps are %s",
+        spread / 1000, threshold / 1000,
+        "meeting positions" if trusted else "jitter, so segments will be laid end to end",
+    )
+    return trusted
+
+
+def _lay_end_to_end(archive: RecordingArchive, *, everything: bool) -> None:
+    """Lay segments back to back in Connect's own numbering order.
+
+    Picture and sound get separate cursors: a screen share runs *underneath* the
+    microphone segments rather than after them.
+    """
     for role in Role:
-        pending = [s for s in archive.streams if s.role == role and s.offset_source == "unresolved"]
+        if not role.is_media:
+            continue
+        in_role = [s for s in archive.streams if s.role == role]
+        pending = in_role if everything else [s for s in in_role if s.offset_source == "unresolved"]
         if not pending:
             continue
-        placed = [s for s in archive.streams if s.role == role and s.offset_source != "unresolved"]
-        cursor = max((s.end_ms for s in placed), default=0)
-        for stream in sorted(pending, key=lambda s: s.sequence):
+        if everything:
+            cursor = 0
+        else:
+            placed = [s for s in in_role if s.offset_source != "unresolved"]
+            cursor = max((s.end_ms for s in placed), default=0)
+        for stream in sorted(pending, key=lambda s: (s.seq, s.sequence, s.name)):
             stream.offset_ms = cursor
             stream.offset_source = "sequential" if cursor else "assumed-zero"
             cursor += stream.duration_ms
 
-    _normalise(archive)
-
 
 def _normalise(archive: RecordingArchive) -> None:
     """Shift the whole timeline so the recording starts at zero."""
-    considered = [s for s in archive.streams if s.role != Role.INDEX and s.duration_ms > 0]
+    considered = [s for s in archive.streams if s.role.is_media and s.duration_ms > 0]
     if not considered:
         return
     base = min(s.offset_ms for s in considered)

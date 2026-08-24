@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "FFmpegMissing", "ensure_ffmpeg", "render_audio", "render_video",
-    "make_speed_variant", "atempo_chain", "transcode_for_web",
+    "make_speed_variant", "atempo_chain", "transcode_for_web", "audio_branch",
 ]
 
 AUDIO_ENCODERS = {
@@ -97,6 +97,25 @@ def _quote(token: str) -> str:
 
 # ------------------------------------------------------------------- audio
 
+def audio_branch(stream: Stream, input_index: int, label: str) -> str:
+    """One filter branch: normalise a segment, level it, delay it into place.
+
+    The order matters.  Levelling comes before the delay so the padding stays
+    true silence rather than amplified nothing.
+    """
+    chain = [
+        # Connect's VoIP audio is mono at odd sample rates; normalise first
+        # so the mixer is not resampling several different formats at once.
+        "aresample=async=1:first_pts=0",
+        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
+    ]
+    if stream.gain_db >= 0.1:
+        chain.append(f"volume={stream.gain_db:.1f}dB")
+    if stream.offset_ms > 0:
+        chain.append(f"adelay={stream.offset_ms}:all=1")
+    return f"[{input_index}:a]{','.join(chain)}[{label}]"
+
+
 def build_audio_filter(streams: list[Stream]) -> tuple[str, str]:
     """Filtergraph placing each audio stream at its offset and mixing them.
 
@@ -109,15 +128,7 @@ def build_audio_filter(streams: list[Stream]) -> tuple[str, str]:
     labels: list[str] = []
     for index, stream in enumerate(streams):
         label = f"a{index}"
-        chain = [
-            # Connect's VoIP audio is mono at odd sample rates; normalise first
-            # so the mixer is not resampling several different formats at once.
-            "aresample=async=1:first_pts=0",
-            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
-        ]
-        if stream.offset_ms > 0:
-            chain.append(f"adelay={stream.offset_ms}:all=1")
-        parts.append(f"[{index}:a]{','.join(chain)}[{label}]")
+        parts.append(audio_branch(stream, index, label))
         labels.append(f"[{label}]")
 
     if len(labels) == 1:
@@ -136,12 +147,17 @@ def render_audio(
     out_path: Path,
     *,
     fmt: str = "mp3",
+    streams: list[Stream] | None = None,
     tool: Tool | None = None,
     dry_run: bool = False,
 ) -> Path:
-    """Mix every voice stream into one timeline-correct lecture track."""
+    """Mix every voice stream into one timeline-correct lecture track.
+
+    ``streams`` narrows the mix (``--only-speaker``); by default every
+    audio-bearing stream in the archive goes in.
+    """
     tool = tool or ensure_ffmpeg(dry_run=dry_run)
-    streams = archive.audio_streams
+    streams = archive.audio_streams if streams is None else streams
     if not streams:
         raise RuntimeError(
             "this recording contains no audio-bearing stream. "
@@ -236,13 +252,7 @@ def build_video_filter(
         for stream in audio:
             index = slot_for(stream)
             label = f"pa{index}"
-            chain = [
-                "aresample=async=1:first_pts=0",
-                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
-            ]
-            if stream.offset_ms > 0:
-                chain.append(f"adelay={stream.offset_ms}:all=1")
-            parts.append(f"[{index}:a]{','.join(chain)}[{label}]")
+            parts.append(audio_branch(stream, index, label))
             labels.append(f"[{label}]")
         if len(labels) == 1:
             parts.append(f"{labels[0]}anull[aout]")
@@ -266,6 +276,7 @@ def render_video(
     crf: int = 28,
     preset: str = "veryfast",
     camera_pip: bool = True,
+    audio: list[Stream] | None = None,
     tool: Tool | None = None,
     dry_run: bool = False,
 ) -> Path:
@@ -281,7 +292,7 @@ def render_video(
     if cameras and screens and screens[0].role.value == "camera":
         cameras = []
 
-    audio = archive.audio_streams
+    audio = archive.audio_streams if audio is None else audio
     duration_s = max(archive.duration_ms / 1000.0, 1.0)
 
     graph, inputs, vlabel, alabel = build_video_filter(

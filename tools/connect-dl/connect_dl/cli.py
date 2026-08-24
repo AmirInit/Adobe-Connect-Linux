@@ -12,10 +12,11 @@ from pathlib import Path
 
 from . import __version__
 from .api import AuthError, ConnectClient, ConnectError, Recording  # noqa: F401
-from .archive import RecordingArchive, Role, unpack
+from .archive import LAYOUTS, RecordingArchive, Role, unpack
 from .fetch import download_recording
 from .flv import LEGACY_AUDIO, LEGACY_VIDEO
 from .index import parse_events
+from .levels import level_streams, quiet_report
 from .media import FFmpegMissing, ensure_ffmpeg, make_speed_variant, render_audio, render_video
 from .player import PlayerSources, write_player
 from .urls import InvalidLink, parse_link
@@ -76,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect = sub.add_parser("inspect", help="show what a downloaded archive contains")
     inspect.add_argument("path", type=Path)
+    inspect.add_argument("--layout", choices=LAYOUTS, default="auto",
+                         help="see how a different alignment would place the segments")
+    inspect.add_argument("--no-level", action="store_true",
+                         help="skip measuring microphone levels (faster)")
 
     listing = sub.add_parser("list", help="list the recordings in a room or folder")
     listing.add_argument("url")
@@ -97,6 +102,15 @@ def _output_options(p: argparse.ArgumentParser) -> None:
                         "Only needed for players with no speed control - the "
                         "generated page can already play at any rate.")
     g.add_argument("--no-player", action="store_true", help="do not generate the HTML player")
+    g.add_argument("--only-speaker", type=int, metavar="N",
+                   help="keep just one speaker's microphone; run 'inspect' to see who is who")
+    g.add_argument("--layout", choices=LAYOUTS, default="auto",
+                   help="how to place segments in time. 'timeline' trusts the "
+                        "recorded start times, 'sequential' ignores them and lays "
+                        "the segments end to end (default: auto)")
+    g.add_argument("--no-level", action="store_true",
+                   help="do not equalise the loudness of different microphones "
+                        "(levelling is on by default)")
     g.add_argument("--no-camera", action="store_true",
                    help="leave the webcam out of the rendered video")
     g.add_argument("--width", type=int, default=1280, help="video width (default: 1280)")
@@ -233,7 +247,7 @@ def cmd_get(args) -> int:
         print("nothing to reconstruct - open it in any player and set the speed there.")
         return 0
 
-    archive = unpack(result.path, source_dir)
+    archive = unpack(result.path, source_dir, layout=args.layout)
     if not args.keep_source:
         result.path.unlink(missing_ok=True)
 
@@ -244,17 +258,45 @@ def cmd_rebuild(args) -> int:
     path: Path = args.path
     if not path.exists():
         raise ConnectError(f"{path} does not exist")
-    archive = unpack(path, path.parent / "source")
+    archive = unpack(path, path.parent / "source", layout=args.layout)
     return _produce(archive, args, args.out)
 
 
 def cmd_inspect(args) -> int:
+    """Report what is in an archive - timeline, speakers, quiet mics - and stop."""
     path: Path = args.path
-    archive = unpack(path, path.parent / "source")
+    archive = unpack(path, path.parent / "source", layout=args.layout)
+
+    raised = [] if args.no_level else _level(archive)
     print(archive.summary())
+
+    totals = archive.speaker_totals()
+    if len(totals) > 1:
+        print("\nspeakers, by microphone time:")
+        for speaker, ms in sorted(totals.items(), key=lambda kv: -kv[1]):
+            print(f"  speaker {speaker}: {ms / 60000:5.1f} min")
+        print("  the lecturer is usually the one with the most; keep only them")
+        print("  with --only-speaker N")
+
+    if raised:
+        print()
+        for line in quiet_report(raised):
+            print(line)
+
     events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
     print(f"\nchapters: {len(events.markers)}   chat lines: {len(events.chat)}")
     return 0
+
+
+def _level(archive: RecordingArchive) -> list:
+    """Measure the microphones, unless ffmpeg is missing (then skip quietly)."""
+    try:
+        tool = ensure_ffmpeg()
+    except FFmpegMissing:
+        log.info("ffmpeg is not installed, so microphone levels cannot be measured")
+        return []
+    print("measuring microphone levels (one pass per segment; --no-level skips this)")
+    return level_streams(archive.audio_streams, ffmpeg=tool.ffmpeg)
 
 
 # ------------------------------------------------------------------ pipeline
@@ -271,11 +313,14 @@ _CONTAINER_ICONS = {
 
 
 def _resolve_room(client: ConnectClient, link):
-    """Turn a room/folder link into a recording link, saying so out loud.
+    """Offer the recordings inside a room link - but never insist on it.
 
-    Raises ConnectError with an explicit explanation when the link identifies a
-    container that holds no recordings - previously this fell through to the
-    downloader, which polled a login page for half an hour.
+    A room handle is not a dead end: on the servers this tool is used against,
+    ``<room>/output/class.zip`` downloads the room's recording directly and no
+    separate recording handle exists at all.  So this looks for recordings to
+    choose from and, when there are none to offer, hands the original link back
+    for the downloader to try.  (It used to raise here, which turned a link that
+    would have worked into a hard failure.)
     """
     sco = client.resolve_url_path(link.url_path)
     icon = (sco.get("icon") or sco.findtext("icon") or "").strip()
@@ -284,17 +329,13 @@ def _resolve_room(client: ConnectClient, link):
         return link  # an archive (or something else with its own payload)
 
     name = sco.findtext("name") or link.url_path
-    print(f"{link.base} is a {kind} ({name!r}), not a recording.")
-
     recordings = client.meeting_recordings(sco.get("sco-id", ""))
     if not recordings:
-        raise ConnectError(
-            f"that link is a {kind}, not a recording, and it contains no "
-            "recordings this account can see. Open the room in a browser, find "
-            "the recording you want, and pass its link instead."
-        )
+        log.info("%s is a %s (%r) with no separately listed recordings; "
+                 "downloading from the room handle itself", link.base, kind, name)
+        return link
 
-    print(f"it contains {len(recordings)} recording(s).\n")
+    print(f"{link.base} is a {kind} ({name!r}) holding {len(recordings)} recording(s).")
     return _choose(recordings, link)
 
 
@@ -338,14 +379,6 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
     _apply_offsets(archive, args.offset)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print()
-    print(archive.summary())
-    print()
-
-    stem = _safe_name(archive.title) or "lecture"
-    notes = _notes(archive)
-    audio_path = video_path = None
-
     if not args.dry_run:
         try:
             ensure_ffmpeg()
@@ -355,18 +388,45 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
             print(f"  connect-dl rebuild {archive.root}")
             return 1
 
+    audio = archive.audio_for(args.only_speaker)
+    if args.only_speaker is not None and not audio:
+        raise ConnectError(
+            f"no microphone segments belong to speaker {args.only_speaker}. "
+            "Run 'connect-dl inspect' on the source folder to see which speakers "
+            "this recording has."
+        )
+
+    raised = []
+    if not args.no_level and audio and not args.dry_run:
+        raised = _level(archive)
+
+    print()
+    print(archive.summary())
+    if raised:
+        print()
+        for line in quiet_report(raised):
+            print(line)
+    print()
+
+    stem = _safe_name(archive.title) or "lecture"
+    notes = _notes(archive, raised)
+    audio_path = video_path = None
+
     # Audio first: it is the deliverable that must not fail, and it is quick.
-    if not args.no_audio and archive.audio_streams:
+    if not args.no_audio and audio:
         audio_path = out_dir / f"{stem}.{args.audio_format}"
-        render_audio(archive, audio_path, fmt=args.audio_format, dry_run=args.dry_run)
+        render_audio(archive, audio_path, fmt=args.audio_format, streams=audio,
+                     dry_run=args.dry_run)
         print(f"  audio  -> {audio_path}")
 
         if args.speed:
             fast = out_dir / f"{stem}-{args.speed:g}x.{args.audio_format}"
             make_speed_variant(audio_path, fast, args.speed, dry_run=args.dry_run)
             print(f"  audio  -> {fast}  ({args.speed:g}x)")
-    elif not archive.audio_streams:
+    elif not audio:
         print("  !! no audio stream in this recording - skipping the audio mixdown")
+        print("     if the class used a telephone bridge, its audio is not in the")
+        print("     archive at all and only a Connect administrator can retrieve it.")
 
     if not args.audio_only and archive.video_streams:
         video_path = out_dir / f"{stem}.mp4"
@@ -374,7 +434,7 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
             render_video(
                 archive, video_path,
                 width=args.width, height=args.height, fps=args.fps,
-                camera_pip=not args.no_camera, dry_run=args.dry_run,
+                camera_pip=not args.no_camera, audio=audio, dry_run=args.dry_run,
             )
             print(f"  video  -> {video_path}")
         except RuntimeError as exc:
@@ -407,16 +467,29 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
     return 0
 
 
-def _notes(archive: RecordingArchive) -> list[str]:
+def _notes(archive: RecordingArchive, raised: list | None = None) -> list[str]:
     notes: list[str] = []
+    if archive.layout == "sequential":
+        notes.append(
+            "The recorded start times were start-up jitter rather than positions "
+            "in the meeting, so the segments were laid end to end in recorded "
+            "order. If that sounds out of order, rebuild with --layout timeline."
+        )
     guessed = [s for s in archive.streams
                if s.offset_source in ("sequential", "assumed-zero") and s.duration_ms > 0]
-    if guessed:
+    if guessed and archive.layout != "sequential":
         names = ", ".join(s.name for s in guessed[:4])
         notes.append(
             f"Start times for {names} were guessed rather than read from the "
             f"recording; if those parts drift out of sync, correct them with "
             f"--offset NAME=MILLISECONDS and run 'connect-dl rebuild'."
+        )
+    if raised:
+        loudest = max(raised, key=lambda s: s.gain_db)
+        notes.append(
+            f"{len(raised)} quiet microphone(s) were raised to be audible "
+            f"(up to +{loudest.gain_db:.0f} dB on {loudest.name}). Use --no-level "
+            "to keep the original levels."
         )
     legacy = {s.info.audio_codec for s in archive.streams
               if s.info and s.info.audio_codec in LEGACY_AUDIO}
