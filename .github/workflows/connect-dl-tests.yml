@@ -1,0 +1,45 @@
+# Tests for tools/connect-dl only.
+#
+# The C++ client is deliberately not built here: it needs the pinned CEF 86
+# binary distribution (a large download) and has its own release workflow.
+# This job exists so a change to the Python tool is checked in seconds.
+name: connect-dl tests
+
+on:
+  push:
+    paths:
+      - 'tools/connect-dl/**'
+      - '.github/workflows/connect-dl-tests.yml'
+  pull_request:
+    paths:
+      - 'tools/connect-dl/**'
+      - '.github/workflows/connect-dl-tests.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the tool claims to support; 3.13 is what people
+        # actually have. Nothing here needs ffmpeg - the tests build their own
+        # FLV files and never render.
+        python-version: ['3.9', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the test suite
+        working-directory: tools/connect-dl
+        run: python -m unittest discover tests -v
+
+      - name: Check the CLI starts and the standalone copy parses
+        working-directory: tools/connect-dl
+        run: |
+          python -m connect_dl --help > /dev/null
+          python -m compileall -q connect_dl standalone
