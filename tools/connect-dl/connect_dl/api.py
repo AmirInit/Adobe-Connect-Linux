@@ -76,6 +76,16 @@ def _permanent_reason(exc: Exception) -> str | None:
                 "Check the link for a typo, and that you are on a network that "
                 "can reach this server."
             )
+        # A plain-HTTP answer on a port we spoke TLS to.  No amount of retrying
+        # will make the other end start speaking TLS.
+        if isinstance(item, ssl.SSLError) and "WRONG_VERSION_NUMBER" in str(
+            getattr(item, "reason", "") or item
+        ):
+            return (
+                "the server answered without TLS, so this address does not speak "
+                "https. If the link really is a plain-HTTP one, write it out in "
+                "full as http://..."
+            )
     return None
 
 

@@ -108,7 +108,10 @@ def parse_link(raw: str) -> ConnectLink:
     if not parsed.netloc:
         raise InvalidLink(f"could not find a host in {raw!r}")
 
-    scheme = "https" if parsed.scheme in ("", "http", "connectpro") else parsed.scheme
+    # A bare host or one of Connect's private schemes means https; an explicit
+    # http:// is left alone.  Rewriting it produced a WRONG_VERSION_NUMBER TLS
+    # error that reads like a broken server rather than "we changed your URL".
+    scheme = "https" if parsed.scheme in ("", "connectpro", "connect", "meeting") else parsed.scheme
     origin = urlunparse((scheme, parsed.netloc, "", "", "", "")).rstrip("/")
 
     query = parse_qs(parsed.query)
