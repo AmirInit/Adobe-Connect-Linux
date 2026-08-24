@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .api import AuthError, ConnectClient, ConnectError, Recording  # noqa: F401
+from .annotations import render_annotations, report_lines, scan_annotations
 from .archive import LAYOUTS, RecordingArchive, Role, unpack
 from .fetch import download_recording
 from .flv import LEGACY_AUDIO, LEGACY_VIDEO
@@ -123,6 +124,10 @@ def _output_options(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-level", action="store_true",
                    help="do not equalise the loudness of different microphones "
                         "(levelling is on by default)")
+    g.add_argument("--render-annotations", action="store_true",
+                   help="try to reconstruct whiteboard/handwritten annotations as "
+                        "SVG. Off by default; what exists is always reported either "
+                        "way. Best effort - see the README.")
     g.add_argument("--no-camera", action="store_true",
                    help="leave the webcam out of the rendered video")
     g.add_argument("--width", type=int, default=1280, help="video width (default: 1280)")
@@ -351,6 +356,10 @@ def cmd_inspect(args) -> int:
         for line in quiet_report(raised):
             print(line)
 
+    print()
+    for line in report_lines(scan_annotations(archive)):
+        print(line)
+
     events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
     print(f"\nchapters: {len(events.markers)}   chat lines: {len(events.chat)}")
     return 0
@@ -557,6 +566,23 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
     if not args.dry_run:
         for written in _write_sidecars(events, out_dir):
             print(f"  text   -> {written}")
+
+    # Whiteboard writing is never in the video, so silence here would look like
+    # success. Say what exists whether or not it can be drawn.
+    scan = scan_annotations(archive)
+    print()
+    for line in report_lines(scan, suggest_render=not args.render_annotations):
+        print(line)
+    if args.render_annotations and not args.dry_run:
+        files, annotation_notes = render_annotations(scan, out_dir / "annotations")
+        for path in files:
+            print(f"  board  -> {path}")
+        notes.extend(annotation_notes)
+    elif scan.has_drawing:
+        notes.append(
+            "This recording contains whiteboard drawing that is not in the video. "
+            "Rebuild with --render-annotations to attempt to reconstruct it."
+        )
 
     page = None
     if not args.no_player and not args.dry_run and (audio_path or video_path):

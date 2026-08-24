@@ -17,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from connect_dl.annotations import render_annotations, report_lines, scan_annotations
 from connect_dl.api import (
     AuthError, ConnectClient, ConnectError, _permanent_reason, looks_like_login_page,
 )
@@ -73,6 +74,26 @@ def make_flv(path, *, start_ms, dur_ms, audio=None, video=None, w=0, h=0):
             buf += _tag(9, ts, bytes([0x10 | video]))
         if audio:
             buf += _tag(8, ts, bytes([(audio << 4) | 0x02]))
+    Path(path).write_bytes(buf)
+
+
+def _amf_number(x):
+    return b"\x00" + struct.pack(">d", float(x))
+
+
+def _amf_strict_array(values):
+    return b"\x0a" + struct.pack(">I", len(values)) + b"".join(_amf_number(v) for v in values)
+
+
+def make_event_flv(path, messages):
+    """An FLV holding only script-data tags, the way Connect's event streams are.
+
+    ``messages`` is a sequence of ``(timestamp_ms, name, amf_payload_bytes)``.
+    """
+    buf = b"FLV\x01\x00" + struct.pack(">I", 9) + struct.pack(">I", 0)
+    for ts, name, payload in messages:
+        body = b"\x02" + _amf_str(name) + payload
+        buf += _tag(18, ts, body)
     Path(path).write_bytes(buf)
 
 
@@ -481,6 +502,117 @@ class TestPlayer(unittest.TestCase):
         self.assertIn("Convolution", page)
         self.assertIn("where are we", page)
         self.assertIn("seekTo(item.t)", page)   # clicking a line jumps there
+
+
+class TestAnnotations(unittest.TestCase):
+    """Whiteboard writing is never in the video, so silence about it looks
+    exactly like success.  These pin what gets said and what gets drawn."""
+
+    def _archive_with(self, rec, messages, name="ftcontent_1_1.flv"):
+        make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+        make_event_flv(rec.path / name, messages)
+        return unpack(rec.path, rec.path)
+
+    def test_a_recording_with_no_annotation_data_says_so(self):
+        with TempRecording() as rec:
+            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+            scan = scan_annotations(unpack(rec.path, rec.path))
+            self.assertFalse(scan.has_data)
+            self.assertIn("none", " ".join(report_lines(scan)).lower())
+
+    def test_event_streams_are_decoded_and_counted(self):
+        with TempRecording() as rec:
+            archive = self._archive_with(rec, [
+                (1000, "onDraw", _amf_strict_array([10, 10, 20, 40, 30, 10])),
+                (2500, "onDraw", _amf_strict_array([50, 50, 90, 90])),
+                (3000, "chatMessage", b"\x02" + _amf_str("not drawing")),
+            ])
+            scan = scan_annotations(archive)
+            self.assertTrue(scan.has_data)
+            self.assertEqual(scan.total_tags, 3)
+            report = scan.streams[0]
+            self.assertEqual(report.names["onDraw"], 2)
+            self.assertEqual(report.names["chatMessage"], 1)
+            self.assertEqual((report.first_ms, report.last_ms), (1000, 3000))
+            # only the drawing-shaped ones become commands
+            self.assertEqual([c.name for c in scan.draw_commands], ["onDraw", "onDraw"])
+            self.assertEqual(scan.draw_commands[0].points, [(10, 10), (20, 40), (30, 10)])
+
+    def test_the_report_names_the_stream_and_the_vocabulary(self):
+        with TempRecording() as rec:
+            archive = self._archive_with(rec, [
+                (0, "wb.drawLine", _amf_strict_array([1, 2, 3, 4])),
+            ])
+            text = " ".join(report_lines(scan_annotations(archive)))
+            self.assertIn("ftcontent_1_1.flv", text)
+            self.assertIn("wb.drawLine", text)
+            self.assertIn("--render-annotations", text)
+
+    def test_drawing_is_rendered_to_svg_split_at_board_clears(self):
+        with TempRecording() as rec:
+            archive = self._archive_with(rec, [
+                (1000, "onDraw", _amf_strict_array([0, 0, 10, 10])),
+                (2000, "onDraw", _amf_strict_array([10, 10, 20, 0])),
+                (3000, "onClearAll", b"\x05"),
+                (4000, "onDraw", _amf_strict_array([0, 20, 30, 20])),
+            ])
+            files, notes = render_annotations(scan_annotations(archive), rec.path / "ann")
+            names = sorted(p.name for p in files)
+            self.assertIn("annotations-report.txt", names)
+            self.assertIn("annotations-01.svg", names)
+            self.assertIn("annotations-02.svg", names)   # the clear split them
+            self.assertIn("annotations-final.svg", names)
+
+            first = (rec.path / "ann" / "annotations-01.svg").read_text()
+            self.assertIn("<polyline", first)
+            self.assertIn("reconstructed", first)
+            self.assertTrue(any("board state" in n for n in notes))
+
+    def test_undrawable_data_fails_loudly_and_still_leaves_the_evidence(self):
+        # The case that matters most: annotation events exist, but this
+        # Connect version's dialect is one we cannot draw.  It must say the
+        # whiteboard was NOT reproduced, and write out what it saw.
+        with TempRecording() as rec:
+            archive = self._archive_with(rec, [
+                (1000, "mysteryPenEvent", b"\x02" + _amf_str("opaque")),
+                (2000, "mysteryPenEvent", b"\x02" + _amf_str("opaque")),
+            ])
+            scan = scan_annotations(archive)
+            self.assertTrue(scan.has_data)
+            self.assertFalse(scan.has_drawing)
+
+            files, notes = render_annotations(scan, rec.path / "ann")
+            self.assertEqual([p.name for p in files], ["annotations-report.txt"])
+            joined = " ".join(notes)
+            self.assertIn("NOT reproduced", joined)
+            self.assertIn("annotations-report.txt", joined)
+
+            dump = files[0].read_text()
+            self.assertIn("mysteryPenEvent", dump)      # the evidence is kept
+            self.assertIn("ftcontent_1_1.flv", dump)
+
+    def test_an_undecodable_stream_is_reported_not_swallowed(self):
+        with TempRecording() as rec:
+            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+            # A script tag whose AMF0 body is nonsense.
+            make_event_flv(rec.path / "ftcontent_9_9.flv",
+                           [(500, "x", b"\xff\xff\xff\xff\xff\xff")])
+            scan = scan_annotations(unpack(rec.path, rec.path))
+            report = scan.streams[0]
+            self.assertEqual(report.tags, 1)
+            self.assertEqual(report.opaque_values, 1)   # the name read, the body did not
+            self.assertIn("did not decode", " ".join(report_lines(scan)))
+
+    def test_an_amf3_body_is_named_as_such_rather_than_shrugged_at(self):
+        # 0x11 switches AMF0 to AMF3, which this decoder does not implement.
+        # Saying so is most of the way to supporting such a recording.
+        with TempRecording() as rec:
+            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+            make_event_flv(rec.path / "ftcontent_1_1.flv",
+                           [(500, "onDraw", b"\x11\x0a\x0b\x01")])
+            scan = scan_annotations(unpack(rec.path, rec.path))
+            self.assertIn("AMF3", scan.streams[0].marker_note)
+            self.assertIn("AMF3", " ".join(report_lines(scan)))
 
 
 class TestSidecarsAndPlay(unittest.TestCase):

@@ -24,7 +24,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-__all__ = ["FlvInfo", "scan_flv", "AUDIO_CODECS", "VIDEO_CODECS"]
+__all__ = [
+    "FlvInfo", "scan_flv", "iter_script_tags", "AUDIO_CODECS", "VIDEO_CODECS",
+]
 
 TAG_AUDIO = 8
 TAG_VIDEO = 9
@@ -186,6 +188,70 @@ def _as_int(value) -> int | None:
     if isinstance(value, (int, float)) and value > 0:
         return int(value)
     return None
+
+
+def iter_script_tags(path: Path, *, max_tags: int = 200_000):
+    """Yield ``(timestamp_ms, name, value, undecoded_marker, raw_len)`` per tag.
+
+    Connect's event streams (``ftchat``, ``ftcontent``, ``indexstream``…) are
+    FLV containers whose payload is entirely script-data tags: AMF0 messages
+    with a name and an argument, timestamped against the meeting.  Nothing here
+    interprets them - it is a faithful decode of whatever is in the file, so
+    that a stream can be *reported* even when its vocabulary is unknown.
+
+    ``value`` is ``None`` when the AMF0 body could not be decoded; ``raw_len``
+    is always the payload size, so undecodable tags can still be counted and
+    measured.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            header = fh.read(9)
+            if len(header) < 9 or header[:3] != b"FLV":
+                return
+            fh.seek(max(struct.unpack(">I", header[5:9])[0], 9))
+            fh.read(4)  # PreviousTagSize0
+
+            for _ in range(max_tags):
+                tag_header = fh.read(11)
+                if len(tag_header) < 11:
+                    return
+                tag_type = tag_header[0] & 0x1F
+                data_size = int.from_bytes(tag_header[1:4], "big")
+                ts = int.from_bytes(tag_header[4:7], "big") | (tag_header[7] << 24)
+                if data_size < 0 or fh.tell() + data_size > size:
+                    return
+
+                if tag_type == TAG_SCRIPT:
+                    payload = fh.read(data_size)
+                    yield (ts,) + _script_message(payload) + (data_size,)
+                else:
+                    fh.seek(data_size, 1)
+                fh.read(4)  # PreviousTagSize
+    except (OSError, struct.error) as exc:  # pragma: no cover - defensive
+        log.debug("%s: %s", path, exc)
+        return
+
+
+def _script_message(payload: bytes) -> tuple[str | None, object, int | None]:
+    """Decode one script tag into ``(name, value, undecoded_marker)``.
+
+    Tolerates anything.  ``undecoded_marker`` is the AMF type byte that could
+    not be read, or ``None`` when the body decoded - worth keeping, because
+    marker 0x11 means the body switched to AMF3 and that is the single most
+    useful thing to know about a stream we cannot read.
+    """
+    try:
+        name, offset = _amf0_value(payload, 0)
+    except (ValueError, struct.error, UnicodeDecodeError, IndexError):
+        return None, None, payload[0] if payload else None
+    if not isinstance(name, str):
+        return None, None, payload[0] if payload else None
+    try:
+        value, _ = _amf0_value(payload, offset)
+    except (ValueError, struct.error, UnicodeDecodeError, IndexError):
+        return name, None, payload[offset] if offset < len(payload) else None
+    return name, value, None
 
 
 # ------------------------------------------------------------------ AMF0

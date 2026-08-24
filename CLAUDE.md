@@ -96,7 +96,7 @@ discovery at it from the repo root fails with `Start directory is not importable
 
 ```bash
 cd tools/connect-dl
-python3 -m unittest discover tests          # 64 tests
+python3 -m unittest discover tests          # 71 tests
 python3 -m unittest tests.test_connect_dl.TestUrls.test_recording_link   # a single test
 ```
 
@@ -155,6 +155,7 @@ The tool models a recording as: **fetch → identify → align → render**, imp
   ffmpeg is what makes a render "succeed" while producing the wrong thing.
 - `index.py` — parses the recording's XML event stream into chapter markers and chat transcript
   (`parse_events`).
+- `annotations.py` — whiteboard/handwriting. See the dedicated section below.
 - `media.py` — builds and runs the `ffmpeg` filter graphs: `build_audio_filter`/`render_audio`
   (delay + mix each audio segment onto its true offset), `build_video_filter`/`render_video`
   (screenshare + webcam PIP composite), `atempo_chain` (chains `atempo` filters since ffmpeg caps
@@ -176,6 +177,56 @@ policy, login-page detection). Change one of those and change both.
 Design invariant worth preserving: audio rendering must never be taken down by a video failure —
 `_produce()` catches video `RuntimeError` and downgrades it to a note rather than failing the
 whole command.
+
+### Whiteboard / annotation streams — what is actually in them
+
+When a lecturer writes by hand, **none of that writing is in the screen-share video**. Connect
+records annotations as vector draw-commands in the event streams and the Flash player redrew
+them at playback time. A rebuild without them produces a blank board that *looks* like a
+finished render — the worst failure mode available — so `annotations.py` reports what exists on
+every run, and `--render-annotations` attempts to draw it.
+
+**Byte-level layout, verified against the FLV/AMF0 specifications and the fixtures in
+`TestAnnotations`:**
+
+- `ftchat*`, `ftcontent*`, `indexstream*`, `transcriptstream*` are ordinary FLV containers
+  (`FLV\x01`, 9-byte header, then the usual `(prev-tag-size, 11-byte tag header, payload)` chain)
+  whose payload is **entirely tag type 18, script data** — no audio and no video tags at all,
+  which is why they read as "empty" to any normal media tool and why `_classify()` must judge
+  them by name.
+- Each script tag is one timestamped message: AMF0 short-string (`0x02`) name, then a single
+  AMF0 value as its argument. The tag's 24+8-bit timestamp is the meeting position, which is what
+  makes the commands placeable on the same timeline as the media.
+- `flv.iter_script_tags()` decodes that generically and yields
+  `(timestamp_ms, name, value, undecoded_marker, raw_len)`. It never interprets — a stream whose
+  vocabulary is unknown still gets counted, timed and dumped.
+- `undecoded_marker` is the AMF type byte that stopped the decode. **`0x11` is the one that
+  matters**: it switches the payload to AMF3, which this decoder does not implement. If a real
+  archive reports `0x11`, that — not the command names — is the thing to fix first.
+- A body that decodes *to* AMF0 null (`0x05`) is not a failure; that is what a "clear the board"
+  message looks like. The marker, not the value, distinguishes them.
+
+**What is NOT verified.** No real Connect archive was available when this was written, so the
+*vocabulary* — which message names mean pen-down versus line versus text, and the coordinate
+order inside the argument — is inferred, not confirmed. The code is built so that being wrong
+about it is safe rather than silently destructive: a message is only treated as drawing if its
+name matches `_DRAW_HINTS` and its argument yields numbers, anything else is counted and dumped
+verbatim, and `render_annotations()` writes `annotations-report.txt` **whether or not it draws
+anything**. That report is the artifact to work from — it lists every message name with counts,
+the timestamp span, the type bytes seen, and the first 40 drawing-shaped payloads with their raw
+numbers.
+
+**To finish this properly**, run against a real recording that used the whiteboard:
+
+```bash
+./tools/connect-dl/connect-dl get "<link>" -o ./wb --render-annotations
+cat ./wb/annotations/annotations-report.txt
+```
+
+If the SVGs look like the board, the inferred vocabulary was right. If the report is full of
+unrecognised names or `0x11`, it says exactly what the dialect is. Never make this path fail
+silently or draw a guess — a wrong reconstruction of a professor's derivation is worse than an
+honest "not reproduced".
 
 ### How a real Connect server behaves (verified against `vadavc41.ec.iau.ir`, Connect 10.8.0)
 

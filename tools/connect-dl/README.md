@@ -185,6 +185,7 @@ All optional.
 | `--only-speaker N` | keep just one person's microphone (see `inspect`) |
 | `--layout timeline\|sequential` | override how segments are placed in time |
 | `--no-level` | leave the microphone levels exactly as recorded |
+| `--render-annotations` | try to reconstruct whiteboard writing (see below) |
 | `--no-open` | do not open the browser when the rebuild finishes |
 | `--audio-format m4a\|opus\|wav` | default is `mp3` |
 | `--no-camera` | leave the webcam out of the video |
@@ -212,19 +213,53 @@ reconstructed from `source/`, so trying a different `--layout`, `--offset` or
 ## Whiteboard and handwritten annotations
 
 **If your professor writes by hand on Connect's whiteboard, that writing is not
-in the video, and this tool cannot currently reproduce it.**
+in the video.** Connect stores annotations as vector draw-commands in the
+recording's event streams (`ftcontent*`, `indexstream*`), not as pixels in the
+screen share. The Flash player redrew them live at playback time; the recorded
+video simply does not contain them.
 
-Connect stores annotations as vector draw-commands in the recording's event
-streams (`ftcontent*`, `indexstream*`), not as pixels in the screen-share video.
-The Flash player used to draw them live at playback time; the screen-share
-stream that gets recorded does not contain them.
+So a rebuilt lecture can have a blank board and still look like a finished
+render. That is the failure this tool refuses to hand you silently.
 
-The event streams that hold it are visible in `inspect`, listed under
-`metadata (not media)` — `ftcontent*` is the one that carries drawing.
+**Every run reports what annotation data exists**, whether or not it can draw
+it — how many events, in which streams, over what span, and which message names
+they use:
 
-If a lecture depended on the whiteboard, the honest answer today is that you
-also need the slides or someone's notes. This is being worked on; the tool will
-never silently pretend the writing was captured.
+```
+annotations:
+  ftcontent_1_1.flv    412 events over  38.2 min   [wb.drawStroke x331, onClearAll x6, ...]
+  388 of those look like drawing (2914 points). Pass --render-annotations to try to draw them.
+```
+
+**To attempt reconstruction**, add `--render-annotations`:
+
+```bash
+./connect-dl get "<link>" -o ./class07 --render-annotations
+```
+
+You get an `annotations/` folder with one SVG per board state (split wherever
+the board was cleared), a final-state SVG, and `annotations-report.txt`.
+
+### What this can and cannot promise
+
+The container work is solid: the event streams are decoded properly, message by
+message, with real meeting timestamps. **The command vocabulary is not verified
+against a real archive** — which name means "pen stroke" and in which order the
+coordinates come is inferred. So:
+
+- A message is only drawn if it looks unambiguously like drawing. Anything else
+  is counted and written out, never guessed into a line that was not there.
+- If nothing can be drawn, the tool says **plainly** that the whiteboard was not
+  reproduced. It does not produce an empty SVG and call it done.
+- `annotations-report.txt` is written **either way**, listing every message name
+  with counts, the timestamp span, the AMF type bytes seen and the raw
+  coordinate payloads. If your recording does not render, that file is exactly
+  what is needed to add support for its dialect — it is worth keeping.
+
+A reconstruction is a reconstruction: check it against the audio before trusting
+it for anything that matters. If a lecture depended entirely on the whiteboard
+and the report shows nothing drawable, the honest answer today is that you also
+need the slides or someone's notes.
 
 ---
 
@@ -301,7 +336,7 @@ not need `ffprobe`, a fuller player, the tests.
 
 ```bash
 cd tools/connect-dl
-python3 -m unittest discover tests        # 64 tests, a fraction of a second
+python3 -m unittest discover tests        # 71 tests, a fraction of a second
 ```
 
 Run them from `tools/connect-dl/` — `tests/` has no `__init__.py`, so pointing
