@@ -219,9 +219,8 @@ streams (`ftcontent*`, `indexstream*`), not as pixels in the screen-share video.
 The Flash player used to draw them live at playback time; the screen-share
 stream that gets recorded does not contain them.
 
-connect-dl **always tells you** whether a recording carries annotation data, so
-you know whether anything is missing rather than wondering why the board is
-blank. `inspect` reports it, and so does a normal run.
+The event streams that hold it are visible in `inspect`, listed under
+`metadata (not media)` — `ftcontent*` is the one that carries drawing.
 
 If a lecture depended on the whiteboard, the honest answer today is that you
 also need the slides or someone's notes. This is being worked on; the tool will

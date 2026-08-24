@@ -26,6 +26,11 @@ Flatpak
 repo
 .flatpak-builder
 *.yml
+# ...but CI definitions are source, not build output.  Without this, adding a
+# workflow silently does nothing: `git add` skips it and the file only exists
+# on the machine that wrote it.  The tracked workflows predate the *.yml rule
+# above, which was aimed at the generated Flatpak manifest beside it.
+!.github/workflows/*.yml
 flatpak_connect.desktop
 connect-test
 
