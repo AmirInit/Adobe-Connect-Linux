@@ -40,8 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="connect-dl",
         description="Download an Adobe Connect class recording and rebuild it "
-                    "into files you can actually play - including a single "
-                    "continuous audio track of the lecturer's voice.",
+                    "into files you can actually play - a single continuous "
+                    "audio track of the lecturer's voice, the reconstructed "
+                    "video, and an offline player that opens itself.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG,
     )
@@ -63,7 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "an intercepting proxy)")
 
     get = sub.add_parser("get", help="download and rebuild a recording")
-    get.add_argument("url", help="recording or meeting-room link")
+    # Optional on purpose: `connect-dl get` with no arguments at all should ask
+    # for the link and then do everything else by itself.
+    get.add_argument("url", nargs="?",
+                     help="any Connect link - recording or meeting room, with or "
+                          "without a ?session= token. Asked for if omitted.")
     auth_options(get)
     _output_options(get)
     get.add_argument("--keep-source", action="store_true",
@@ -84,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="skip measuring microphone levels (faster)")
 
     listing = sub.add_parser("list", help="list the recordings in a room or folder")
-    listing.add_argument("url")
+    listing.add_argument("url", nargs="?", help="a meeting-room or folder link")
     auth_options(listing)
 
     play = sub.add_parser("play", help="open a rebuilt recording's player in your browser")
@@ -132,18 +137,30 @@ def _output_options(p: argparse.ArgumentParser) -> None:
 
 
 EPILOG = """
-examples:
-  # list what is available in a class room
-  connect-dl list https://connect.example.edu/l993retztu2a/ -u me@example.edu
+the short version:
+  connect-dl get                      asks for the link, then does everything
+  connect-dl get "<paste the link>"   same, with the link already in hand
 
-  # download one recording and rebuild everything
-  connect-dl get https://connect.example.edu/p8fj3k2la9x/ -u me@example.edu -o ./class07
+Either one downloads the recording, rebuilds the audio and video, writes the
+chat and chapters beside them, and opens the player in your browser.  Every
+flag below is optional.
 
-  # just the lecturer's voice, as fast as possible
-  connect-dl get https://connect.example.edu/p8fj3k2la9x/ --session BREEZE... --audio-only
+more examples:
+  # what recordings does this class room have?
+  connect-dl list https://connect.example.edu/l993retztu2a/
 
-  # the streams are misaligned - nudge one and rebuild without downloading again
-  connect-dl rebuild ./class07/source --offset cameraVoip_1_2=2670000
+  # somewhere other than here, and just the voice (much faster)
+  connect-dl get "https://connect.example.edu/p8fj3k2la9x/?session=abc" -o ./class07 --audio-only
+
+  # everybody is talking at once - lay the segments end to end instead
+  connect-dl rebuild ./class07/source -o ./class07 --layout sequential
+
+  # keep only the lecturer's microphone (inspect shows who is who)
+  connect-dl inspect ./class07/source
+  connect-dl rebuild ./class07/source -o ./class07 --only-speaker 1
+
+  # watch it again later
+  connect-dl play ./class07
 """
 
 
@@ -168,14 +185,58 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
+def _ask_link(raw: str | None) -> str:
+    """The link, asked for when it was not given."""
+    if raw and raw.strip():
+        return raw.strip()
+    if not sys.stdin.isatty():
+        raise InvalidLink(
+            "no link given. Pass one on the command line: "
+            "connect-dl get https://connect.example.edu/abc123/"
+        )
+    answer = input("Connect link: ").strip()
+    if not answer:
+        raise InvalidLink("no link given")
+    return answer
+
+
+def _ask_session(args, link) -> str | None:
+    """Find a BREEZESESSION, in the order that costs the user the least.
+
+    A link pasted out of the browser usually carries ``?session=…`` already -
+    that token does not authenticate as a query parameter, but it is the right
+    value to send as the Cookie header, so it is used rather than asked for.
+    """
+    if args.session:
+        return args.session
+    if link.session:
+        print("using the session token found in the link")
+        return link.session
+    from_env = os.environ.get("CONNECT_SESSION")
+    if from_env:
+        return from_env
+    if args.user or not sys.stdin.isatty():
+        return None
+    # Not echoed: it is a live credential for the whole Connect account.
+    entered = getpass.getpass("BREEZESESSION cookie (blank if public): ").strip()
+    return entered or None
+
+
 def _client(args) -> tuple[ConnectClient, object]:
-    link = parse_link(args.url)
+    link = parse_link(_ask_link(getattr(args, "url", None)))
     client = ConnectClient(origin=link.origin, verify_tls=not args.insecure)
 
-    session = args.session or link.session or os.environ.get("CONNECT_SESSION")
+    session = _ask_session(args, link)
     if session:
         client.set_session(session)
-        who = client.check_session()
+        try:
+            who = client.check_session()
+        except ConnectError as exc:
+            # The XML API being unreachable or closed to this account says
+            # nothing about the session itself, and the asset download does not
+            # go through the API - so this is a note, not a failure.
+            log.info("could not confirm the session through the API (%s)", exc)
+            who = "(unverified)"
         if not who:
             # An expired or mistyped cookie otherwise behaves exactly like
             # passing nothing at all, and the run fails much later with a
@@ -492,9 +553,13 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
             notes.append("Video rendering failed; the audio track is unaffected.")
             video_path = None
 
+    events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
+    if not args.dry_run:
+        for written in _write_sidecars(events, out_dir):
+            print(f"  text   -> {written}")
+
     page = None
     if not args.no_player and not args.dry_run and (audio_path or video_path):
-        events = parse_events(archive.xml_files, duration_ms=archive.duration_ms)
         page = write_player(
             out_dir / "play.html",
             title=archive.title or stem,
@@ -523,6 +588,38 @@ def _produce(archive: RecordingArchive, args, out_dir: Path) -> int:
             print(f"\nopen {page} in a browser to watch it "
                   f"(or run: connect-dl play {out_dir})")
     return 0
+
+
+def _write_sidecars(events, out_dir: Path) -> list[Path]:
+    """Write the chat and chapter list as plain text beside the media.
+
+    The player embeds both, but a text file is greppable, quotable and outlives
+    any browser - so they are written as separate files as well.
+    """
+    written: list[Path] = []
+    if events.chat:
+        path = out_dir / "chat.txt"
+        path.write_text(
+            "\n".join(
+                f"[{_clock(c.time_ms)}] {c.sender + ': ' if c.sender else ''}{c.message}"
+                for c in events.chat
+            ) + "\n",
+            encoding="utf-8",
+        )
+        written.append(path)
+    if events.markers:
+        path = out_dir / "chapters.txt"
+        path.write_text(
+            "\n".join(f"[{_clock(m.time_ms)}] {m.label}" for m in events.markers) + "\n",
+            encoding="utf-8",
+        )
+        written.append(path)
+    return written
+
+
+def _clock(ms: int) -> str:
+    seconds = max(0, ms) // 1000
+    return f"{seconds // 3600:d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
 def _notes(archive: RecordingArchive, raised: list | None = None) -> list[str]:
