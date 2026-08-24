@@ -82,8 +82,12 @@ class ConnectLink:
 
 
 def _clean_host_scheme(raw: str) -> str:
-    """Map Connect's private schemes onto https."""
-    lowered = raw.strip()
+    """Strip the packaging a pasted link arrives in, and normalise the scheme.
+
+    Links get copied out of chat messages and shell history, so they turn up
+    wrapped in quotes and angle brackets as often as not.
+    """
+    lowered = raw.strip().strip("<>").strip("\"'").strip()
     for scheme in ("connectpro://", "connect://", "meeting://"):
         if lowered.lower().startswith(scheme):
             rest = lowered[len(scheme) :]

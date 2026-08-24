@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import re
 import socket
 import ssl
 import struct
@@ -19,14 +20,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from connect_dl.api import (
     AuthError, ConnectClient, ConnectError, _permanent_reason, looks_like_login_page,
 )
-from connect_dl.cli import _client
-from connect_dl.archive import Role, Stream, unpack
-from connect_dl.fetch import _MP4_CANDIDATES, _ZIP_CANDIDATES, download_recording
+from connect_dl.cli import _client, _write_sidecars, find_player
+from connect_dl.archive import METADATA_PREFIXES, Role, Stream, unpack
+from connect_dl.fetch import (
+    _MP4_CANDIDATES, _ZIP_CANDIDATES, download_recording, zip_is_complete,
+)
 from connect_dl.flv import scan_flv
 from connect_dl.index import parse_events
+from connect_dl.levels import QUIET_THRESHOLD_DB, TARGET_MEAN_DB, plan_gain
 from connect_dl.media import atempo_chain, build_audio_filter, build_video_filter
-from connect_dl.player import PlayerSources, write_player
+from connect_dl.player import SPEEDS, PlayerSources, write_player
 from connect_dl.urls import InvalidLink, parse_link
+
+STANDALONE = Path(__file__).resolve().parents[1] / "standalone" / "ac_downloader.py"
 
 
 # --------------------------------------------------------------- FLV builder
@@ -116,6 +122,39 @@ class TestUrls(unittest.TestCase):
         with self.assertRaises(InvalidLink):
             parse_link("   ")
 
+    def test_messy_launcher_url_yields_handle_and_session(self):
+        # What people actually paste: the desktop launcher's URL, quoted, with
+        # the token buried among other parameters.  Everything the tool needs
+        # has to come out of it without the user pulling it apart by hand.
+        link = parse_link(
+            '  "connectpro://vadavc41.ec.iau.ir/l993retztu2a/'
+            '?proto=true&session=adminbreezbf4z42bw46m46pp5&pbMode=normal"  '
+        )
+        self.assertEqual(link.origin, "https://vadavc41.ec.iau.ir")
+        self.assertEqual(link.url_path, "l993retztu2a")
+        self.assertEqual(link.session, "adminbreezbf4z42bw46m46pp5")
+        self.assertEqual(
+            link.asset("output/class.zip?download=zip"),
+            "https://vadavc41.ec.iau.ir/l993retztu2a/output/class.zip?download=zip",
+        )
+
+    def test_session_is_found_whatever_it_is_called(self):
+        for key in ("session", "BREEZESESSION", "breezesession"):
+            with self.subTest(key=key):
+                self.assertEqual(parse_link(f"https://h.edu/abc123/?{key}=T0K").session, "T0K")
+
+    def test_an_explicit_http_link_stays_http(self):
+        # Rewriting it to https produced a WRONG_VERSION_NUMBER TLS error that
+        # read like a broken server rather than like a URL we had changed.
+        self.assertEqual(parse_link("http://127.0.0.1:8731/abc123/").origin,
+                         "http://127.0.0.1:8731")
+        # ...while a bare host still means https.
+        self.assertEqual(parse_link("acc.example.edu/abc123/").origin, "https://acc.example.edu")
+
+    def test_an_asset_url_still_resolves_to_its_handle(self):
+        link = parse_link("https://h.edu/p8fj3k2la9x/output/class.zip?download=zip")
+        self.assertEqual(link.url_path, "p8fj3k2la9x")
+
 
 class TestFlv(unittest.TestCase):
     def test_reads_codecs_and_metadata(self):
@@ -184,11 +223,141 @@ class TestOffsets(unittest.TestCase):
             self.assertEqual(roles["screenshare_1_1.flv"], Role.SCREENSHARE)
             self.assertEqual(roles["mainstream.flv"], Role.MAIN)
 
+    def test_jitter_sized_timestamps_are_not_read_as_positions(self):
+        # The bug this threshold exists for.  On a real 38-minute recording six
+        # microphone segments all began within 4.4s of each other - start-up
+        # jitter - and every one of those starts was non-zero, so the old
+        # "any non-zero start means real positions" rule stacked all six on top
+        # of each other and everybody talked at once.
+        with TempRecording() as rec:
+            for i, start in enumerate([0, 1200, 2400, 3300, 4000, 4400], 1):
+                make_flv(rec.path / f"cameraVoip_1_{i}.flv",
+                         start_ms=start, dur_ms=380_000, audio=6)
+            archive = unpack(rec.path, rec.path)
+            self.assertEqual(archive.layout, "sequential")
+            offsets = sorted(s.offset_ms for s in archive.streams)
+            self.assertEqual(offsets, [0, 380_000, 760_000, 1_140_000, 1_520_000, 1_900_000])
+            # 6 x 6.3 min of material really is a 38-minute lecture, not a
+            # 6-minute one with everyone shouting over each other.
+            self.assertEqual(archive.duration_ms, 2_280_000)
+
+    def test_timestamps_spread_across_the_lecture_are_read_as_positions(self):
+        # The other branch: the same six segments, genuinely stamped with where
+        # they belong.  Here the stamps must be kept exactly.
+        starts = [0, 400_000, 800_000, 1_200_000, 1_600_000, 2_000_000]
+        with TempRecording() as rec:
+            for i, start in enumerate(starts, 1):
+                make_flv(rec.path / f"cameraVoip_1_{i}.flv",
+                         start_ms=start, dur_ms=380_000, audio=6)
+            archive = unpack(rec.path, rec.path)
+            self.assertEqual(archive.layout, "timeline")
+            self.assertEqual(sorted(s.offset_ms for s in archive.streams), starts)
+
+    def test_layout_can_be_forced_either_way(self):
+        starts = [0, 400_000, 800_000]
+        with TempRecording() as rec:
+            for i, start in enumerate(starts, 1):
+                make_flv(rec.path / f"cameraVoip_1_{i}.flv",
+                         start_ms=start, dur_ms=380_000, audio=6)
+            forced = unpack(rec.path, rec.path, layout="sequential")
+            self.assertEqual(forced.layout, "sequential")
+            self.assertEqual(sorted(s.offset_ms for s in forced.streams),
+                             [0, 380_000, 760_000])
+
+        with TempRecording() as rec:
+            for i in range(1, 4):
+                make_flv(rec.path / f"cameraVoip_1_{i}.flv",
+                         start_ms=i * 1000, dur_ms=380_000, audio=6)
+            forced = unpack(rec.path, rec.path, layout="timeline")
+            self.assertEqual(forced.layout, "timeline")
+            self.assertEqual(sorted(s.offset_ms for s in forced.streams), [0, 1000, 2000])
+
+    def test_speaker_and_sequence_come_from_the_file_name(self):
+        with TempRecording() as rec:
+            make_flv(rec.path / "cameraVoip_3_11.flv", start_ms=0, dur_ms=1000, audio=6)
+            make_flv(rec.path / "cameraVoip_7_2.flv", start_ms=0, dur_ms=2000, audio=6)
+            archive = unpack(rec.path, rec.path)
+            by_name = {s.name: s for s in archive.streams}
+            self.assertEqual((by_name["cameraVoip_3_11.flv"].speaker,
+                              by_name["cameraVoip_3_11.flv"].seq), (3, 11))
+            self.assertEqual(archive.speaker_totals(), {3: 1000, 7: 2000})
+            self.assertEqual([s.name for s in archive.audio_for(7)], ["cameraVoip_7_2.flv"])
+
     def test_mainstream_is_the_fallback_when_nothing_else_has_audio(self):
         with TempRecording() as rec:
             make_flv(rec.path / "mainstream.flv", start_ms=0, dur_ms=60000, audio=6, video=3, w=800, h=600)
             archive = unpack(rec.path, rec.path)
             self.assertEqual([s.name for s in archive.audio_streams], ["mainstream.flv"])
+
+
+class TestMetadataIsNotMedia(unittest.TestCase):
+    """ftchat/ftcontent/indexstream/transcriptstream are events, not media.
+
+    They are FLV files and they can contain media-looking tags, so nothing but
+    the name distinguishes them.  Handing one to ffmpeg is what makes a render
+    "succeed" while producing the wrong thing.
+    """
+
+    def test_metadata_streams_are_classified_and_never_rendered(self):
+        with TempRecording() as rec:
+            make_flv(rec.path / "cameraVoip_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+            for prefix in METADATA_PREFIXES:
+                # Deliberately given real audio tags: the name must win anyway.
+                make_flv(rec.path / f"{prefix}_1_1.flv", start_ms=0, dur_ms=60000, audio=6)
+            archive = unpack(rec.path, rec.path)
+
+            names = {s.name for s in archive.metadata_streams}
+            self.assertEqual(len(names), len(METADATA_PREFIXES))
+            for prefix in METADATA_PREFIXES:
+                self.assertIn(f"{prefix}_1_1.flv", names)
+
+            rendered = {s.name for s in archive.audio_streams} | \
+                       {s.name for s in archive.video_streams} | \
+                       {s.name for s in archive.camera_streams}
+            self.assertEqual(rendered, {"cameraVoip_1_1.flv"})
+            # ...and they do not stretch the timeline either.
+            self.assertEqual(archive.duration_ms, 60000)
+
+    def test_the_prefix_list_matches_the_standalone_copy(self):
+        # The two copies of this tool must agree about what is metadata; a file
+        # wrongly treated as media is a silently wrong render in either.
+        source = STANDALONE.read_text(encoding="utf-8")
+        listed = re.search(r"METADATA_PREFIXES = \((.*?)\)", source, re.S).group(1)
+        self.assertEqual(set(re.findall(r'"([a-z]+)"', listed)), set(METADATA_PREFIXES))
+
+
+class TestLevelling(unittest.TestCase):
+    """Raising a quiet microphone without wrecking a good one."""
+
+    def test_a_quiet_mic_is_brought_up_toward_the_target(self):
+        gain = plan_gain(mean_db=-40.0, max_db=-25.0)
+        self.assertAlmostEqual(gain, 20.0)                 # -40 -> -20
+        self.assertGreaterEqual(gain, QUIET_THRESHOLD_DB)  # and worth reporting
+
+    def test_boost_is_capped_so_peaks_cannot_clip(self):
+        # Wants +30 to hit the target, but the peak is already at -2 dB.
+        self.assertAlmostEqual(plan_gain(mean_db=-50.0, max_db=-2.0), 0.5)
+
+    def test_near_silence_is_not_amplified_into_hiss(self):
+        self.assertEqual(plan_gain(mean_db=-91.0, max_db=-85.0), 0.0)
+        self.assertLessEqual(plan_gain(mean_db=-69.0, max_db=-60.0), 30.0)
+
+    def test_a_loud_mic_is_never_ducked(self):
+        self.assertEqual(plan_gain(mean_db=-5.0, max_db=-0.5), 0.0)
+        self.assertEqual(plan_gain(mean_db=TARGET_MEAN_DB, max_db=-3.0), 0.0)
+
+    def test_gain_reaches_the_filtergraph_before_the_delay(self):
+        # Order matters: levelling first, so adelay's padding stays true
+        # silence rather than amplified nothing.
+        stream = Stream(path=Path("cameraVoip_2_2.flv"), role=Role.CAMERA, offset_ms=20000)
+        stream.gain_db = 12.5
+        graph, _ = build_audio_filter([stream])
+        self.assertIn("volume=12.5dB", graph)
+        self.assertLess(graph.index("volume=12.5dB"), graph.index("adelay=20000"))
+
+    def test_no_gain_means_no_volume_filter(self):
+        stream = Stream(path=Path("a.flv"), role=Role.CAMERA, offset_ms=0)
+        self.assertNotIn("volume=", build_audio_filter([stream])[0])
 
 
 class TestMedia(unittest.TestCase):
@@ -276,6 +445,115 @@ class TestPlayer(unittest.TestCase):
             self.assertIn("&lt;7&gt;", html)          # title escaped
             self.assertIn("playbackRate", html)       # the whole point
             self.assertIn("preservesPitch", html)
+
+    def test_speed_buttons_reach_the_rate_the_page_can_actually_play(self):
+        # applyRate clamps to 0.25-16; the buttons must not stop short of it,
+        # since skimming a two-hour class back is what the page is for.
+        self.assertEqual(max(SPEEDS), 16)
+        self.assertIn(1, SPEEDS)
+        self.assertTrue(all(0.25 <= s <= 16 for s in SPEEDS))
+
+    def test_everything_that_follows_playback_reads_the_media_clock(self):
+        # If any of these ran off a timer of its own, the sidebar would drift
+        # away from the picture as soon as the speed changed.
+        with TempRecording() as rec:
+            page = write_player(
+                rec.path / "play.html", title="x",
+                sources=PlayerSources(video="v.mp4"),
+                events=parse_events([]), duration_s=60.0,
+            ).read_text()
+        script = page.split("<script>")[1]
+        self.assertIn("media.currentTime", script)
+        self.assertIn("requestAnimationFrame", script)
+        self.assertNotIn("setInterval", script)   # no clock of its own
+
+    def test_chapters_and_chat_are_clickable_and_embedded(self):
+        with TempRecording() as rec:
+            (rec.path / "ftchat.xml").write_text(
+                '<chat><message time="9000" from="Sara">where are we</message></chat>')
+            (rec.path / "indexstream.xml").write_text(
+                '<index><event time="4000" name="Convolution"/></index>')
+            events = parse_events([rec.path / "ftchat.xml", rec.path / "indexstream.xml"])
+            page = write_player(
+                rec.path / "play.html", title="x",
+                sources=PlayerSources(audio="a.mp3"), events=events, duration_s=600.0,
+            ).read_text()
+        self.assertIn("Convolution", page)
+        self.assertIn("where are we", page)
+        self.assertIn("seekTo(item.t)", page)   # clicking a line jumps there
+
+
+class TestSidecarsAndPlay(unittest.TestCase):
+    def test_chat_and_chapters_are_written_as_text(self):
+        with TempRecording() as rec:
+            (rec.path / "ftchat.xml").write_text(
+                '<chat><message time="3661000" from="Ali">salaam</message></chat>')
+            (rec.path / "indexstream.xml").write_text(
+                '<index><event time="5000" name="Start"/></index>')
+            events = parse_events([rec.path / "ftchat.xml", rec.path / "indexstream.xml"])
+            written = _write_sidecars(events, rec.path)
+            names = sorted(p.name for p in written)
+            self.assertEqual(names, ["chapters.txt", "chat.txt"])
+            self.assertEqual((rec.path / "chat.txt").read_text(),
+                             "[1:01:01] Ali: salaam\n")
+            self.assertEqual((rec.path / "chapters.txt").read_text(), "[0:00:05] Start\n")
+
+    def test_nothing_is_written_when_there_is_nothing_to_write(self):
+        with TempRecording() as rec:
+            self.assertEqual(_write_sidecars(parse_events([]), rec.path), [])
+            self.assertFalse((rec.path / "chat.txt").exists())
+
+    def test_play_finds_the_player_a_rebuild_left_behind(self):
+        with TempRecording() as rec:
+            (rec.path / "class07").mkdir()
+            page = rec.path / "class07" / "play.html"
+            page.write_text("<html></html>")
+            self.assertEqual(find_player(rec.path / "class07"), page)   # the folder
+            self.assertEqual(find_player(page), page)                   # the file
+            self.assertEqual(find_player(rec.path), page)               # one level up
+            self.assertIsNone(find_player(rec.path / "class07" / "nope"))
+
+
+class TestTheTwoCopiesAgree(unittest.TestCase):
+    """The package and the single-file copy must not drift apart.
+
+    Only on the decisions where disagreeing would silently produce a different
+    recording - not on their code, which is deliberately different.
+    """
+
+    def _standalone(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ac_downloader", STANDALONE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_both_read_the_same_messy_link_the_same_way(self):
+        raw = ('  "connectpro://vadavc41.ec.iau.ir/l993retztu2a/'
+               '?proto=true&session=TOK3N&pbMode=normal"  ')
+        mine = parse_link(raw)
+        theirs = self._standalone().Link(raw)
+        self.assertEqual((mine.origin, mine.url_path, mine.session),
+                         (theirs.origin, theirs.handle, theirs.session))
+        self.assertEqual(mine.asset("output/class.zip?download=zip"),
+                         theirs.asset("output/class.zip?download=zip"))
+
+    def test_both_level_a_microphone_to_the_same_gain(self):
+        standalone = self._standalone()
+        for mean, peak in ((-40.0, -25.0), (-50.0, -2.0), (-91.0, -85.0), (-5.0, -0.5)):
+            with self.subTest(mean=mean, peak=peak):
+                self.assertEqual(plan_gain(mean, peak), standalone.plan_gain(mean, peak))
+
+    def test_both_use_the_same_alignment_threshold(self):
+        from connect_dl import archive as pkg
+        standalone = self._standalone()
+        self.assertEqual(pkg._MIN_SPREAD_MS, standalone.MIN_SPREAD_MS)
+        self.assertEqual(pkg._SPREAD_FRACTION, standalone.SPREAD_FRACTION)
+
+    def test_both_recognise_the_login_page_and_not_the_holding_page(self):
+        standalone = self._standalone()
+        self.assertTrue(standalone.looks_like_login_page(LOGIN_PAGE))
+        self.assertFalse(standalone.looks_like_login_page(HOLDING_PAGE))
 
 
 class TestArchiveSafety(unittest.TestCase):
@@ -380,6 +658,103 @@ class TestDownloadFailsFastOnLogin(unittest.TestCase):
         self.assertIn("could not obtain a downloadable recording", str(caught.exception))
 
 
+def _make_zip(entries=8, payload=200_000):
+    import zipfile as zf_mod
+    buf = io.BytesIO()
+    with zf_mod.ZipFile(buf, "w", zf_mod.ZIP_STORED) as zf:
+        for i in range(entries):
+            zf.writestr(f"cameraVoip_1_{i}.flv", os.urandom(payload // entries))
+    return buf.getvalue()
+
+
+class _RangeResponse:
+    def __init__(self, body, content_type, status, cut_at=None):
+        self._buf = io.BytesIO(body)
+        self._cut = cut_at
+        self._read = 0
+        self.status = status
+        self.headers = {"Content-Type": content_type, "Content-Length": str(len(body))}
+
+    def read(self, n=-1):
+        if self._cut is not None and self._read >= self._cut:
+            raise urllib.error.URLError("connection reset by peer")
+        chunk = self._buf.read(n)
+        self._read += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FlakyServer:
+    """Serves a zip, drops the first transfer halfway, honours Range after."""
+
+    def __init__(self, body, drop_first=True):
+        self.body = body
+        self.drop_first = drop_first
+        self.requests = []
+
+    def _open(self, url, *, headers=None, **kw):
+        self.requests.append((url, (headers or {}).get("Range")))
+        if "class.zip" not in url:
+            return _RangeResponse(LOGIN_PAGE, "text/html", 200)
+        rng = (headers or {}).get("Range")
+        if rng:
+            start = int(rng.split("=")[1].split("-")[0])
+            return _RangeResponse(self.body[start:], "application/zip", 206)
+        cut = len(self.body) // 2 if self.drop_first else None
+        self.drop_first = False
+        return _RangeResponse(self.body, "application/zip", 200, cut_at=cut)
+
+
+class TestBigDownloads(unittest.TestCase):
+    """80 MB+ archives drop mid-transfer; that must not cost the whole run."""
+
+    def test_class_zip_is_tried_before_anything_else(self):
+        # Order is load-bearing: on a real server output/recording.mp4 answers
+        # with the login page, which is terminal, so probing it first aborted
+        # the run before the candidate that works was ever requested.
+        self.assertEqual(_ZIP_CANDIDATES[0], "output/class.zip?download=zip")
+        self.assertTrue(all("zip" in c for c in _ZIP_CANDIDATES))
+
+    def test_a_dropped_transfer_resumes_from_the_bytes_on_disk(self):
+        body = _make_zip()
+        server = _FlakyServer(body)
+        link = parse_link("https://acc.example.edu/l993retztu2a/")
+        with TempRecording() as rec, contextlib.redirect_stdout(io.StringIO()):
+            result = download_recording(server, link, rec.path,
+                                        poll_timeout=30, poll_interval=0)
+            self.assertTrue(result.is_zip)
+            self.assertEqual(result.path.read_bytes(), body)
+            self.assertEqual(result.size, len(body))
+            # nothing left behind
+            self.assertFalse((rec.path / "recording.zip.part").exists())
+
+        ranges = [r for url, r in server.requests if "class.zip" in url]
+        self.assertEqual(ranges[0], None)                    # first attempt: whole file
+        self.assertTrue(ranges[1].startswith("bytes="))      # second: resumed
+        resumed_from = int(ranges[1].split("=")[1].rstrip("-"))
+        self.assertGreater(resumed_from, 0)
+        self.assertLess(resumed_from, len(body))
+
+    def test_a_truncated_zip_is_not_accepted(self):
+        with TempRecording() as rec:
+            good = rec.path / "good.zip"
+            good.write_bytes(_make_zip())
+            self.assertTrue(zip_is_complete(good))
+
+            cut = rec.path / "cut.zip"
+            cut.write_bytes(good.read_bytes()[:-2000])   # central directory gone
+            self.assertFalse(zip_is_complete(cut))
+
+            tiny = rec.path / "tiny.zip"
+            tiny.write_bytes(b"PK\x03\x04" + b"\x00" * 500)
+            self.assertFalse(zip_is_complete(tiny))
+
+
 class TestPermanentTransportErrors(unittest.TestCase):
     """The bug: unresolvable hosts and bad certs were retried 4x over 15s."""
 
@@ -397,6 +772,15 @@ class TestPermanentTransportErrors(unittest.TestCase):
         err = ssl.SSLCertVerificationError("self signed certificate")
         err.reason = "CERTIFICATE_VERIFY_FAILED"
         self.assertIn("--insecure", _permanent_reason(err))
+
+    def test_plain_http_answer_on_a_tls_connection_is_permanent(self):
+        # Speaking https to a plain-HTTP port used to cost four retries with
+        # exponential backoff per candidate URL - about ninety seconds to reach
+        # the identical verdict.
+        err = ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")
+        err.reason = "WRONG_VERSION_NUMBER"
+        self.assertIn("without TLS", _permanent_reason(err))
+        self.assertIn("without TLS", _permanent_reason(urllib.error.URLError(err)))
 
     def test_transient_errors_are_still_retried(self):
         self.assertIsNone(_permanent_reason(TimeoutError("timed out")))
